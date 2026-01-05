@@ -10,7 +10,7 @@ uses
  mqueue,
  vm,
  vmparam,
- sys_vm_object,
+ vm_object,
  vnode,
  vuio,
  kern_mtx,
@@ -25,7 +25,7 @@ const
  PMAPP_BLK_SIZE  =QWORD(QWORD(1) shl PMAPP_BLK_SHIFT);
  PMAPP_BLK_MASK  =PMAPP_BLK_SIZE-1;
 
- PMAPP_BLK_DMEM_BLOCKS=QWORD(VM_DMEM_SIZE) shr PMAPP_BLK_SHIFT;
+ PMAPP_BLK_DMEM_BLOCKS=(QWORD(VM_DMEM_SIZE)+PMAPP_BLK_MASK) shr PMAPP_BLK_SHIFT;
 
 var
  DMEM_FD:array[0..PMAPP_BLK_DMEM_BLOCKS-1] of vm_nt_file_obj;
@@ -104,6 +104,11 @@ procedure pmap_gpu_enter_object(pmap :pmap_t;
                                 __end:vm_offset_t;
                                 prot :vm_prot_t);
 
+procedure pmap_enter_dmem_block(pmap  :pmap_t;
+                                offset:vm_ooffset_t;
+                                start :vm_offset_t;
+                                prot  :vm_prot_t);
+
 procedure pmap_protect(pmap :pmap_t;
                        obj  :vm_object_t;
                        start:vm_offset_t;
@@ -150,6 +155,10 @@ procedure pmap_mirror_unmap(pmap:pmap_t;
 function  pmap_danger_zone(pmap:pmap_t;
                            addr:vm_offset_t;
                            size:vm_offset_t):Boolean;
+
+function  pmap_expand(pmap :pmap_t;
+                      start:vm_offset_t;
+                      __end:vm_offset_t):Boolean;
 
 procedure pmap_gpu_get_bound(pmap:pmap_t;
                              var start:vm_offset_t;
@@ -282,6 +291,8 @@ begin
  begin
   PAGE_PROT:=kmem_alloc(PAGE_MAP_COUNT_SZ1,VM_RW);
   Assert(PAGE_PROT<>nil,'pmap_pinit');
+  //Set cache to be enabled on demand
+  md_dontneed(PAGE_PROT,PAGE_MAP_COUNT_SZ1);
  end;
 
  //rangelock_init(@pmap^.rmlock);
@@ -289,20 +300,28 @@ begin
 
  pmap^.vm_map:=vm_map;
 
+ sys_init_vm_nt;
+
  vm_nt_map_init(@pmap^.nt_map,VM_MINUSER_ADDRESS,VM_MAXUSER_ADDRESS);
  vm_nt_map_init(@pmap^.gp_map,VM_MIN_GPU_ADDRESS,VM_MAX_GPU_ADDRESS);
 
-  //exclude
+ //exclude
  if Length(pmap_mem_guest)>1 then
  begin
-  For i:=0 to High(pmap_mem_guest)-1 do
+  //mark all space as hole
+  vm_nt_map_insert(@pmap^.nt_map,
+                   nil,0,
+                   VM_MINUSER_ADDRESS,
+                   VM_MAXUSER_ADDRESS,
+                   VM_MAXUSER_ADDRESS-VM_MINUSER_ADDRESS,
+                   0);
+  //
+  For i:=0 to High(pmap_mem_guest) do
   begin
-   vm_nt_map_insert(@pmap^.nt_map,
-                    nil,0,
-                    pmap_mem_guest[  i].__end,
-                    pmap_mem_guest[i+1].start,
-                    pmap_mem_guest[i+1].start-pmap_mem_guest[i].__end,
-                    0);
+   //mark used regions as free
+   vm_nt_map_delete(@pmap^.nt_map,
+                    pmap_mem_guest[i].start,
+                    pmap_mem_guest[i].__end);
   end;
  end;
 
@@ -549,6 +568,8 @@ begin
   //current block id
   i:=o shr PMAPP_BLK_SHIFT;
 
+  Assert(i<Length(DMEM_FD));
+
   if (DMEM_FD[i].hfile=0) then
   begin
    R:=md_memfd_create(DMEM_FD[i].hfile,BLK_SIZE,VM_RW);
@@ -655,6 +676,30 @@ begin
  end;
 end;
 
+function Min(a,b:QWORD):QWORD; inline;
+begin
+ if (a<b) then Result:=a else Result:=b;
+end;
+
+function fit_to_vnode_size(obj:vm_object_t;offset,size:QWORD):QWORD; inline;
+begin
+ //max unaligned size
+ size:=size+offset;
+
+ size:=Min(size,obj^.un_pager.vnp.vnp_size);
+
+ //dec offset
+ if (size>offset) then
+ begin
+  size:=size-offset;
+ end else
+ begin
+  size:=0;
+ end;
+
+ Result:=size;
+end;
+
 function  vm_map_lock_range  (map:Pointer;start,__end:off_t;mode:Integer):Pointer; external;
 procedure vm_map_unlock_range(map:Pointer;cookie:Pointer); external;
 
@@ -690,64 +735,73 @@ procedure pmap_copy(src_obj :p_vm_nt_file_obj;
                     size    :vm_ooffset_t;
                     max_size:vm_ooffset_t);
 var
- start :vm_ooffset_t;
- __end :vm_ooffset_t;
  src,dst:Pointer;
  r:Integer;
 begin
- if (size>max_size) then
- begin
-  size:=max_size;
- end;
+ if (max_size=0) then Exit;
 
- start  :=src_ofs and (not (MD_ALLOC_GRANULARITY-1)); //dw
- __end  :=src_ofs+size; //up
- src_ofs:=src_ofs and (MD_ALLOC_GRANULARITY-1);
-
+ //alloc placeholder for src + dst
  src:=Pointer(KERNEL_LOWER); //lower
- r:=md_mmap(src,__end-start,VM_PROT_READ,src_obj^.hfile,start);
-
+ r:=md_placeholder_mmap(src,size*2);
  if (r<>0) then
  begin
-  Writeln('failed md_mmap:0x',HexStr(r,8));
+  Writeln('failed md_placeholder_mmap(',HexStr(size*2,11),'):0x',HexStr(r,8));
+  Assert(false,'pmap_copy');
+  Exit;
+ end;
+
+ dst:=src+size;
+
+ //split to src/dst
+ r:=md_placeholder_split(src,size);
+ if (r<>0) then
+ begin
+  Writeln('failed md_placeholder_split(',HexStr(src),',',size,'):0x',HexStr(r,8));
   Assert(false,'pmap_copy');
  end;
 
- start  :=dst_ofs and (not (MD_ALLOC_GRANULARITY-1)); //dw
- __end  :=dst_ofs+size; //up
- dst_ofs:=dst_ofs and (MD_ALLOC_GRANULARITY-1);
-
- dst:=Pointer(KERNEL_LOWER); //lower
- r:=md_mmap(dst,__end-start,VM_RW,dst_obj^.hfile,start);
-
+ //commit src
+ r:=md_placeholder_commit(src,Min(size,max_size),VM_PROT_READ,src_obj^.hfile,src_ofs);
  if (r<>0) then
  begin
-  Writeln('failed md_mmap:0x',HexStr(r,8));
+  Writeln('failed md_placeholder_commit(',HexStr(src),',',
+                                          Min(size,max_size),',',
+                                          'VM_R',',',
+                                          HexStr(src_obj^.hfile,16),',',
+                                          HexStr(src_ofs,8),'):0x',
+                                          HexStr(r,8));
   Assert(false,'pmap_copy');
+  Exit;
  end;
 
- Move((src+src_ofs)^,(dst+dst_ofs)^,size);
+ //commit dst
+ r:=md_placeholder_commit(dst,size,VM_RW,dst_obj^.hfile,dst_ofs);
+ if (r<>0) then
+ begin
+  Writeln('failed md_placeholder_commit(',HexStr(dst),',',
+                                          Min(size,max_size),',',
+                                          'VM_RW',',',
+                                          HexStr(dst_obj^.hfile,16),',',
+                                          HexStr(dst_ofs,8),'):0x',
+                                          HexStr(r,8));
+  Assert(false,'pmap_copy');
+  Exit;
+ end;
+
+ Move(src^,dst^,Min(size,max_size));
 
  md_cacheflush(dst,size,DCACHE);
 
- r:=md_unmap(dst,__end-start);
-
+ r:=md_placeholder_unmap(src,size*2);
  if (r<>0) then
  begin
-  Writeln('failed md_unmap:0x',HexStr(r,8));
+  Writeln('failed md_placeholder_unmap(',HexStr(src),',',size*2,'):0x',HexStr(r,8));
   Assert(false,'pmap_copy');
  end;
 
- r:=md_unmap(src,__end-start);
-
- if (r<>0) then
- begin
-  Writeln('failed md_unmap:0x',HexStr(r,8));
-  Assert(false,'pmap_copy');
- end;
 end;
 
-function convert_to_gpu_prot(prot:vm_prot_t):vm_prot_t;
+function convert_to_gpu_prot(prot:vm_prot_t):vm_prot_t; inline;
 const
  strict_prot=False;
 begin
@@ -758,6 +812,12 @@ begin
  begin
   Result:=VM_RW;
  end;
+end;
+
+function fixup_prot(prot:vm_prot_t):vm_prot_t; inline;
+begin
+ //fixup writeonly cpu/gpu
+ Result:=prot or ((prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE)) shr 1);
 end;
 
 {
@@ -803,17 +863,7 @@ begin
   Writeln('pmap_enter_object:',HexStr(start,11),':',HexStr(__end,11),':',HexStr(prot,2));
  end;
 
- //fixup writeonly
- if ((prot and VM_PROT_RWX)=VM_PROT_WRITE) then
- begin
-  prot:=prot or VM_PROT_READ;
- end;
-
- //fixup gpu writeonly
- if ((prot and VM_PROT_GPU_ALL)=VM_PROT_GPU_WRITE) then
- begin
-  prot:=prot or VM_PROT_GPU_READ;
- end;
+ prot:=fixup_prot(prot);
 
  lock:=pmap_wlock(pmap,start,__end);
 
@@ -1032,15 +1082,7 @@ begin
 
        if (fd<>0) then
        begin
-        delta:=(__end-start);
-
-        //max unaligned size
-        size:=offset+delta;
-        if (size>obj^.un_pager.vnp.vnp_size) then
-        begin
-         size:=obj^.un_pager.vnp.vnp_size;
-        end;
-        size:=size-offset;
+        size:=fit_to_vnode_size(obj,offset,(__end-start));
 
         max:=VM_PROT_RW;
         r:=md_memfd_open(md,fd,max);
@@ -1076,6 +1118,7 @@ begin
        Writeln('pmap_enter_cowobj:',HexStr(start,11),':',HexStr(__end,11),':',HexStr(prot,2));
       end;
 
+      //create object for copy
       cow:=vm_nt_file_obj_allocate(md,VM_PROT_READ);
 
       info.offset:=offset;
@@ -1143,9 +1186,18 @@ begin
        info.__end :=start+paddi;
        info.offset:=info.offset+delta;
 
-       size:=size-delta; //unaligned size
+        //unaligned size
+       if (size>delta) then
+       begin
+        size:=size-delta;
+       end else
+       begin
+        size:=0;
+       end;
+
       end;
 
+      //free copy object
       vm_nt_file_obj_destroy(cow);
 
      end else
@@ -1236,11 +1288,7 @@ begin
   Writeln('pmap_gpu_enter_object:',HexStr(start,11),':',HexStr(__end,11),':',HexStr(prot,2));
  end;
 
- //fixup gpu writeonly
- if ((prot and VM_PROT_GPU_ALL)=VM_PROT_GPU_WRITE) then
- begin
-  prot:=prot or VM_PROT_GPU_READ;
- end;
+ prot:=fixup_prot(prot);
 
  lock:=pmap_wlock(pmap,start,__end);
 
@@ -1292,6 +1340,96 @@ begin
   end;
 
   start:=p____end;
+ end;
+
+ pmap_unlock(pmap,lock);
+end;
+
+procedure pmap_enter_dmem_block(pmap  :pmap_t;
+                                offset:vm_ooffset_t;
+                                start :vm_offset_t;
+                                prot  :vm_prot_t);
+var
+ __end:vm_offset_t;
+
+ delta:QWORD;
+
+ info:t_fd_info;
+
+ lock:Pointer;
+
+ r:Integer;
+begin
+ __end:=start+(64*1024);
+
+ if (p_print_pmap) then
+ begin
+  Writeln('pmap_enter_dmem_block:',HexStr(offset,11),':',HexStr(start,11),':',HexStr(prot,2));
+ end;
+
+ prot:=fixup_prot(prot);
+
+ lock:=pmap_wlock(pmap,start,__end);
+
+ ppmap_mark_rwx(start,__end,prot);
+
+ r:=0;
+
+ info.start :=start;
+ info.__end :=__end;
+ info.offset:=offset;
+
+ while (info.start<>info.__end) do
+ begin
+  get_dmem_fd(info);
+
+  delta:=(info.__end-info.start);
+  if (delta=0) then Break;
+
+  if (p_print_pmap) then
+  begin
+   Writeln('vm_nt_map_insert:',HexStr(info.start,11),':',HexStr(info.__end,11),':',HexStr(info.offset,11));
+  end;
+
+  //map to guest
+  r:=vm_nt_map_insert(@pmap^.nt_map,
+                      info.obj,
+                      info.olocal, //block local offset
+                      info.start,
+                      info.__end,
+                      delta,
+                      (prot and VM_RW));
+
+  if (r<>0) then
+  begin
+   Writeln('failed vm_nt_map_insert:0x',HexStr(r,8));
+   Assert(false,'pmap_enter_object');
+  end;
+
+  //map to GPU
+  if (prot and VM_PROT_GPU_ALL)<>0 then
+  begin
+   //extra obj link
+   vm_nt_file_obj_reference(info.obj);
+   //
+   r:=vm_nt_map_insert(@pmap^.gp_map,
+                       info.obj,
+                       info.olocal, //block local offset
+                       info.start+VM_MIN_GPU_ADDRESS,
+                       info.__end+VM_MIN_GPU_ADDRESS,
+                       delta,
+                       convert_to_gpu_prot(prot));
+
+   if (r<>0) then
+   begin
+    Writeln('failed vm_nt_map_insert:0x',HexStr(r,8));
+    Assert(false,'pmap_enter_object');
+   end;
+  end;
+
+  info.start :=info.start +delta;
+  info.__end :=__end;
+  info.offset:=info.offset+delta;
  end;
 
  pmap_unlock(pmap,lock);
@@ -1376,17 +1514,7 @@ begin
   Writeln('pmap_protect:',HexStr(start,11),':',HexStr(__end,11),':prot:',HexStr(prot,2));
  end;
 
- //fixup writeonly
- if ((prot and VM_PROT_RWX)=VM_PROT_WRITE) then
- begin
-  prot:=prot or VM_PROT_READ;
- end;
-
- //fixup gpu writeonly
- if ((prot and VM_PROT_GPU_ALL)=VM_PROT_GPU_WRITE) then
- begin
-  prot:=prot or VM_PROT_GPU_READ;
- end;
+ prot:=fixup_prot(prot);
 
  lock:=pmap_rlock(pmap,start,__end);
 
@@ -1447,11 +1575,7 @@ procedure pmap_gpu_protect(pmap :pmap_t;
 var
  lock:Pointer;
 begin
- //fixup gpu writeonly
- if ((prot and VM_PROT_GPU_ALL)=VM_PROT_GPU_WRITE) then
- begin
-  prot:=prot or VM_PROT_GPU_READ;
- end;
+ prot:=fixup_prot(prot);
 
  lock:=pmap_rlock(pmap,start,__end);
 
@@ -1523,27 +1647,17 @@ procedure pmap_madvise(pmap  :pmap_t;
                        start :vm_offset_t;
                        __end :vm_offset_t;
                        advise:Integer);
-{
 label
  _default;
 var
  lock:Pointer;
 
  r:Integer;
-}
 begin
  if (p_print_pmap) then
  begin
-  Writeln('pmap_madv_free:',HexStr(start,11),':',HexStr(__end,11),':',HexStr(advise,2));
+  Writeln('pmap_madvise:',HexStr(start,11),':',HexStr(__end,11),':',HexStr(advise,2));
  end;
-
- {
- In freebsd the MADV_FREE status is reset when data is written to the page,
-  so in Windows it is easier to do nothing than to protect the page from being
-  written and then restore its normal status
- }
-
-{
 
  lock:=pmap_wlock(pmap,start,__end);
 
@@ -1586,12 +1700,10 @@ begin
  if (r<>0) then
  begin
   Writeln('failed md_reset:0x',HexStr(r,8));
-  Assert(false,'pmap_madv_free');
+  Assert(false,'pmap_madvise');
  end;
 
  pmap_unlock(pmap,lock);
-}
-
 end;
 
 procedure unmap_dmem_gc(start,__end:QWORD); external;
@@ -1743,7 +1855,7 @@ begin
  r:=md_placeholder_unmap(base,size);
  if (r<>0) then
  begin
-  Writeln('failed md_unmap_ex:0x',HexStr(r,8));
+  Writeln('failed md_placeholder_unmap:0x',HexStr(r,8));
   Assert(false,'pmap_mirror_unmap');
  end;
 end;
@@ -1760,6 +1872,42 @@ begin
  end;
 end;
 
+function pmap_expand(pmap :pmap_t;
+                     start:vm_offset_t;
+                     __end:vm_offset_t):Boolean;
+var
+ base:Pointer;
+ lock:Pointer;
+ r:Integer;
+begin
+ Result:=True;
+
+ if (p_print_pmap) then
+ begin
+  Writeln('pmap_expand:',HexStr(start,11),':',HexStr(__end,11));
+ end;
+
+ base:=Pointer(start);
+
+ lock:=pmap_wlock(pmap,start,__end);
+
+  r:=md_placeholder_mmap(base,__end-start,MD_MAP_FIXED);
+
+  if (r<>0) then
+  begin
+   Writeln('failed md_placeholder_mmap:0x',HexStr(r,8));
+   Assert(false,'pmap_expand');
+   Result:=False;
+  end;
+
+  if Result then
+  begin
+   //mark used regions as free
+   vm_nt_map_delete(@pmap^.nt_map,start,__end);
+  end;
+
+ pmap_unlock(pmap,lock);
+end;
 
 end.
 

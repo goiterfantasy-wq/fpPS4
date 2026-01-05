@@ -24,6 +24,7 @@ implementation
 
 uses
  time,
+ md_time,
  vm,
  vmparam,
  vm_pmap_prot,
@@ -47,7 +48,7 @@ var
  td:p_kthread;
 begin
  td:=curkthread;
- jit_save_to_sys_save(td);
+ set_jit_ctx_state(@td^.td_frame,False);
  td^.td_frame.tf_rip:=tf_rip;
  print_error_td('Assert in guest code!');
  Assert(false);
@@ -65,7 +66,7 @@ var
  td:p_kthread;
 begin
  td:=curkthread;
- jit_save_to_sys_save(td);
+ set_jit_ctx_state(@td^.td_frame,False);
  td^.td_frame.tf_rip:=tf_rip;
  print_error_td('System error in guest code!');
  Assert(false);
@@ -88,7 +89,7 @@ var
  td:p_kthread;
 begin
  td:=curkthread;
- jit_save_to_sys_save(td);
+ set_jit_ctx_state(@td^.td_frame,False);
  td^.td_frame.tf_rip:=tf_rip;
  print_error_td('TODO:jit_exit_proc');
  Assert(False);
@@ -204,8 +205,13 @@ begin
  end;
 end;
 
-procedure op_jmp_dispatcher(var ctx:t_jit_context2;cb:t_jit_cb);
+type
+ t_jit_cb_param=procedure(var ctx:t_jit_context2;param:PtrUint);
+
+procedure op_jmp_dispatcher(var ctx:t_jit_context2;cb:t_jit_cb_param;param:PtrUint);
 begin
+ ctx.label_flags:=ctx.label_flags and (not CAN_RESTART);
+
  with ctx.builder do
  begin
 
@@ -216,7 +222,7 @@ begin
 
   if (cb<>nil) then
   begin
-   cb(ctx);
+   cb(ctx,param);
   end;
 
   jmp(r14);
@@ -239,8 +245,10 @@ begin
  end;
 end;
 
-procedure op_call_dispatcher(var ctx:t_jit_context2;cb:t_jit_cb);
+procedure op_call_dispatcher(var ctx:t_jit_context2;cb:t_jit_cb_param;param:PtrUint);
 begin
+ ctx.label_flags:=ctx.label_flags and (not CAN_RESTART);
+
  with ctx.builder do
  begin
 
@@ -251,7 +259,7 @@ begin
 
   if (cb<>nil) then
   begin
-   cb(ctx);
+   cb(ctx,param);
   end;
 
   jmp(r14);
@@ -259,7 +267,7 @@ begin
 end;
 
 //r14
-procedure op_ret_dispatcher(var ctx:t_jit_context2;cb:t_jit_cb);
+procedure op_ret_dispatcher(var ctx:t_jit_context2;cb:t_jit_cb_param;param:PtrUint);
 var
  link_jcxz:t_jit_i_link;
  link_jmp :t_jit_i_link;
@@ -271,8 +279,8 @@ begin
 
   movq(r15,rcx); //save rcx
 
-  leaq(rcx ,[r14*8]);
-  leaq(r13w,[rcx+rcx]); //r13 = r13 && (!0xFFFF) || Word(r14*16)
+  leaq(ecx ,[r14d+r14d]);
+  leaq(r13w,[ecx*8]); //r13 = r13 && (!0xFFFF) || Word(r14*16)
 
   movq(rcx,[r13]); //-src
 
@@ -315,7 +323,7 @@ begin
 
   if (cb<>nil) then
   begin
-   cb(ctx);
+   cb(ctx,param);
   end;
 
   jmp(r14);
@@ -448,7 +456,7 @@ begin
  end;
 end;
 
-procedure op_push_rip_part1(var ctx:t_jit_context2);
+procedure op_push_rip_part1(var ctx:t_jit_context2;param:PtrUint);
 var
  stack:TRegValue;
 begin
@@ -498,7 +506,7 @@ begin
  end;
 end;
 
-procedure op_pop_rip_part1(var ctx:t_jit_context2);
+procedure op_pop_rip_part1(var ctx:t_jit_context2;imm:PtrUint);
 var
  stack:TRegValue;
 begin
@@ -513,7 +521,7 @@ begin
   //first we move the memory,
   //then we update the register
   op_load_rsp(ctx,stack);
-  leaq(stack,[stack+8+ctx.imm]);
+  leaq(stack,[stack+8+imm]);
   op_save_rsp(ctx,stack);
 
  end;
@@ -528,13 +536,11 @@ var
  link:t_jit_i_link;
  ret_dst:t_jit_i_link;
 begin
- ctx.label_flags:=ctx.label_flags or LF_JMP;
-
  ret_dst:=op_add_local_cache(ctx);
 
  op_push_rip_part0(ctx);
 
- if (ctx.din.Operand[1].RegValue[0].AType=regNone) then
+ if is_imm(ctx.din) then
  begin
   //imm offset
 
@@ -548,7 +554,7 @@ begin
   begin
    //near
 
-   op_push_rip_part1(ctx);
+   op_push_rip_part1(ctx,0);
 
    link:=ctx.get_link(dst);
 
@@ -565,7 +571,7 @@ begin
   begin
    op_set_r14_imm(ctx,Int64(dst));
    //
-   op_call_dispatcher(ctx,@op_push_rip_part1);
+   op_call_dispatcher(ctx,@op_push_rip_part1,0);
   end;
 
  end else
@@ -579,7 +585,7 @@ begin
   //
   ctx.builder.movq(new1,[new1]);
   //
-  op_call_dispatcher(ctx,@op_push_rip_part1);
+  op_call_dispatcher(ctx,@op_push_rip_part1,0);
  end else
  if is_preserved(ctx.din) then
  begin
@@ -592,7 +598,7 @@ begin
    ctx.builder.leaq(new1,[new1+8]);
   end;
   //
-  op_call_dispatcher(ctx,@op_push_rip_part1);
+  op_call_dispatcher(ctx,@op_push_rip_part1,0);
  end else
  begin
   new1:=new_reg_size(r_tmp0,ctx.din.Operand[1]);
@@ -600,7 +606,7 @@ begin
   //
   ctx.builder.movq(new1,new2);
   //
-  op_call_dispatcher(ctx,@op_push_rip_part1);
+  op_call_dispatcher(ctx,@op_push_rip_part1,0);
  end;
 
  if (ret_dst<>nil_link) then
@@ -616,18 +622,15 @@ procedure op_ret(var ctx:t_jit_context2);
 var
  imm:Int64;
 begin
- ctx.label_flags:=ctx.label_flags or LF_JMP;
-
  imm:=0;
  GetTargetOfs(ctx.din,ctx.code,1,imm);
  //
- ctx.imm:=imm;
 
  //
  op_pop_rip_part0(ctx,imm); //out:r14
  //
 
- op_ret_dispatcher(ctx,@op_pop_rip_part1);
+ op_ret_dispatcher(ctx,@op_pop_rip_part1,imm);
  //
  trim_flow(ctx);
 end;
@@ -640,9 +643,9 @@ var
  new1,new2:TRegValue;
  link:t_jit_i_link;
 begin
- ctx.label_flags:=ctx.label_flags or LF_JMP;
+ ctx.label_flags:=ctx.label_flags or CAN_RESTART;
 
- if (ctx.din.Operand[1].RegValue[0].AType=regNone) then
+ if is_imm(ctx.din) then
  begin
   //imm offset
 
@@ -671,7 +674,7 @@ begin
   begin
    op_set_r14_imm(ctx,Int64(dst));
    //
-   op_jmp_dispatcher(ctx,nil);
+   op_jmp_dispatcher(ctx,nil,0);
   end;
 
  end else
@@ -685,7 +688,7 @@ begin
   //
   ctx.builder.movq(new1,[new1]);
   //
-  op_jmp_dispatcher(ctx,nil);
+  op_jmp_dispatcher(ctx,nil,0);
  end else
  if is_preserved(ctx.din) then
  begin
@@ -693,7 +696,7 @@ begin
   //
   op_load(ctx,new1,1);
   //
-  op_jmp_dispatcher(ctx,nil);
+  op_jmp_dispatcher(ctx,nil,0);
  end else
  begin
   new1:=new_reg_size(r_tmp0,ctx.din.Operand[1]);
@@ -701,7 +704,7 @@ begin
   //
   ctx.builder.movq(new1,new2);
   //
-  op_jmp_dispatcher(ctx,nil);
+  op_jmp_dispatcher(ctx,nil,0);
  end;
  //
  trim_flow(ctx);
@@ -743,7 +746,7 @@ var
  dst:Pointer;
  link:t_jit_i_link;
 begin
- ctx.label_flags:=ctx.label_flags or LF_JMP;
+ ctx.label_flags:=ctx.label_flags or CAN_RESTART;
 
  ofs:=0;
  GetTargetOfs(ctx.din,ctx.code,1,ofs);
@@ -769,11 +772,12 @@ begin
  end else
  begin
   //far
+  ctx.label_flags:=ctx.label_flags and (not CAN_RESTART);
 
   //invert cond jump
   id1:=ctx.builder.jcc(invert_cond(ctx.din.OpCode.Suffix),nil_link,os8);
    op_set_r14_imm(ctx,Int64(dst));
-   op_jmp_dispatcher(ctx,nil);
+   op_jmp_dispatcher(ctx,nil,0);
   id1.target:=ctx.builder.get_curr_label.after;
 
   {
@@ -795,7 +799,7 @@ var
  dst:Pointer;
  link:t_jit_i_link;
 begin
- ctx.label_flags:=ctx.label_flags or LF_JMP;
+ ctx.label_flags:=ctx.label_flags or CAN_RESTART;
 
  ofs:=0;
  GetTargetOfs(ctx.din,ctx.code,1,ofs);
@@ -822,13 +826,14 @@ begin
  end else
  begin
   //far
+  ctx.label_flags:=ctx.label_flags and (not CAN_RESTART);
 
   id1:=ctx.builder.loop(ctx.din.OpCode.Suffix,nil_link,ctx.dis.AddressSize,os8);
 
   id2:=ctx.builder.jmp(nil_link,os8);
    id1.target:=ctx.builder.get_curr_label.after;
    op_set_r14_imm(ctx,Int64(dst));
-   op_jmp_dispatcher(ctx,nil);
+   op_jmp_dispatcher(ctx,nil,0);
   id2.target:=ctx.builder.get_curr_label.after;
 
  end;
@@ -841,7 +846,7 @@ var
  dst:Pointer;
  link:t_jit_i_link;
 begin
- ctx.label_flags:=ctx.label_flags or LF_JMP;
+ ctx.label_flags:=ctx.label_flags or CAN_RESTART;
 
  ofs:=0;
  GetTargetOfs(ctx.din,ctx.code,1,ofs);
@@ -868,13 +873,14 @@ begin
  end else
  begin
   //far
+  ctx.label_flags:=ctx.label_flags and (not CAN_RESTART);
 
   id1:=ctx.builder.jcxz(nil_link,ctx.dis.AddressSize,os8);
 
   id2:=ctx.builder.jmp(nil_link,os8);
    id1.target:=ctx.builder.get_curr_label.after;
    op_set_r14_imm(ctx,Int64(dst));
-   op_jmp_dispatcher(ctx,nil);
+   op_jmp_dispatcher(ctx,nil,0);
   id2.target:=ctx.builder.get_curr_label.after;
 
  end;
@@ -929,13 +935,13 @@ begin
   case new.ASize of
     os8:
      begin
-      ctx.builder._RR(movsx8_desc,new,new,os64);
       new:=new_reg_size(new,os64);
+      ctx.builder._RR(movsx8_desc,new,new,False);
      end;
    os32:
      begin
-      ctx.builder._RR(movsxd_desc,new,new,os64);
       new:=new_reg_size(new,os64);
+      ctx.builder._RR(movsxd_desc,new,new,False);
      end
    else;
   end;
@@ -1126,8 +1132,6 @@ end;
 
 procedure op_syscall(var ctx:t_jit_context2);
 begin
- ctx.label_flags:=ctx.label_flags or LF_JMP;
-
  ctx.add_forward_point(fpCall,ctx.ptr_curr);
  ctx.add_forward_point(fpCall,ctx.ptr_next);
  //
@@ -1211,7 +1215,28 @@ procedure op_rdtsc(var ctx:t_jit_context2);
 begin
  if time.strict_ps4_freq then
  begin
-  ctx.builder.call_far(@strict_ps4_rdtsc_jit);
+  with ctx.builder do
+  begin
+   laxf;
+   movq(r14,rax);
+   //
+   rdtsc;
+   //
+   shli8(rdx, 32);
+   orq  (rax,rdx);
+   //
+   //inline md_rev_guest
+   movi64(r15,md_rev_guest);
+   //replacing div with mul, the result in %rdx
+   mulq  (r15);
+   //
+   movq (eax,edx); //get lo
+   shri8(rdx, 32); //get hi
+   //
+   xchgq(rax,r14);
+   saxf;
+   movq (rax,r14);
+  end;
  end else
  begin
   add_orig(ctx);
@@ -1222,7 +1247,43 @@ procedure op_rdtscp(var ctx:t_jit_context2);
 begin
  if time.strict_ps4_freq then
  begin
-  ctx.builder.call_far(@strict_ps4_rdtscp_jit);
+  with ctx.builder do
+  begin
+   laxf;
+   movq(r15,rax);
+   //
+   movq(r14,rbx); //save rbx
+   //
+   movi(eax,1);
+   cpuid;
+   //
+   shri8  (ebx,6); //cpu_id
+   andi8se(ebx,7); //0..7
+   //
+   movi(ecx,7);
+   subq(ecx,ebx);  //7-cpu_id
+   //
+   movq(rbx,r14);  //restore rbx
+   //
+   lfence;
+   rdtsc ;
+   lfence;
+   //
+   shli8(rdx, 32);
+   orq  (rax,rdx);
+   //
+   //inline md_rev_guest
+   movi64(r14,md_rev_guest);
+   //replacing div with mul, the result in %rdx
+   mulq  (r14);
+   //
+   movq (eax,edx); //get lo
+   shri8(rdx, 32); //get hi
+   //
+   xchgq(rax,r15);
+   saxf;
+   movq (rax,r15);
+  end;
  end else
  with ctx.builder do
  begin
@@ -1231,28 +1292,26 @@ begin
   //rcx //result3
   //rbx //backup -> CPUID_LOCAL_APIC_ID 0xff000000 0..7
 
-  movq(r_tmp0,rbx); //save rbx
-
+  movq(r14,rbx); //save rbx
+  //
   movi(eax,1);
-  _O($0FA2);    //cpuid
-
-  //load flags to al,ah
+  cpuid;
+  //
   laxf;
-
+  //
   shri8  (ebx,6); //cpu_id
   andi8se(ebx,7); //0..7
-
+  //
   movi   (ecx,7);
   subq   (ecx,ebx); //7-cpu_id
-
-  //store flags from al,ah
+  //
   saxf;
-
-  movq(rbx,r_tmp0); //restore rbx
-
-  _O($0FAEE8); //lfence
-  _O($0F31);   //rdtsc
-  _O($0FAEE8); //lfence
+  //
+  movq   (rbx,r14); //restore rbx
+  //
+  lfence;
+  rdtsc ;
+  lfence;
  end;
 end;
 
@@ -1645,14 +1704,41 @@ begin
  jit_cbs[OPPnone,OPsldt,OPSnone]:=@op_invalid;
  jit_cbs[OPPnone,OPlldt,OPSnone]:=@op_invalid;
 
- jit_cbs[OPPnone,OPxbegin,OPSnone]:=@op_invalid;
- jit_cbs[OPPnone,OPxend  ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPwbinvd   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPstr      ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPbndldx   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmcall   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmlaunch ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmresume ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmxoff   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPmonitor  ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPmwait    ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPencls    ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmfunc   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPxbegin   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPxend     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPxtest    ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPenclu    ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmrun    ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmmcall  ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmload   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPvmsave   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPstgi     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPclgi     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPskinit   ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPinvlpga  ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPmcommit  ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPmwait    ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPrmpadjust,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPrmpupdate,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPsgdt     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPsidt     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPlgdt     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPlidt     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPsmsw     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPlmsw     ,OPSnone]:=@op_invalid;
+ jit_cbs[OPPnone,OPinvlpg   ,OPSnone]:=@op_invalid;
 
- jit_cbs[OPPnone,OPwbinvd,OPSnone]:=@op_invalid;
-
- jit_cbs[OPPnone,OPstr,OPSnone]:=@op_invalid;
-
- jit_cbs[OPPnone,OPbndldx,OPSnone]:=@op_invalid;
 end;
 
 function test_disassemble(addr:Pointer;vsize:Integer):Boolean;
@@ -1940,8 +2026,7 @@ begin
 
   //
   op_pop_rip_part0(ctx,0); //out:r14
-  ctx.imm:=0;
-  op_jmp_dispatcher(ctx,@op_pop_rip_part1);
+  op_jmp_dispatcher(ctx,@op_pop_rip_part1,0);
   //
 
   //
@@ -1958,7 +2043,7 @@ begin
                 ctx.ptr_next,
                 link_curr,
                 link_next,
-                LF_JMP);
+                0);
   //
   ctx.add_entry_point(ctx.ptr_curr,link_curr);
   //
@@ -1993,7 +2078,7 @@ begin
    op_set_r14_imm(ctx,Int64(node_import^.guest));
    movq(r14,[r14]);
 
-   op_call_dispatcher(ctx,@op_push_rip_part1);
+   op_call_dispatcher(ctx,@op_push_rip_part1,0);
   end;
 
   //---RETURN ENTRY POINT----
@@ -2005,7 +2090,7 @@ begin
                 ctx.ptr_next,
                 link_curr,
                 link_next,
-                LF_JMP);
+                0);
 
   //
   ctx.add_entry_point(ctx.ptr_curr,link_curr);
@@ -2043,7 +2128,7 @@ begin
                 ctx.ptr_next,
                 link_curr,
                 link_next,
-                LF_JMP);
+                0);
   //
   ctx.add_entry_point(ctx.ptr_curr,link_curr);
   //
@@ -2276,7 +2361,7 @@ begin
 
    op_set_r14_imm(ctx,Int64(ptr));
    //
-   op_jmp_dispatcher(ctx,nil);
+   op_jmp_dispatcher(ctx,nil,0);
 
    link_next:=ctx.builder.get_curr_label.after;
    node_next:=link_next._node;
@@ -2586,7 +2671,7 @@ begin
   begin
    op_set_r14_imm(ctx,Int64(ctx.ptr_next));
    //
-   op_jmp_dispatcher(ctx,nil);
+   op_jmp_dispatcher(ctx,nil,0);
    //
    ctx.trim:=True;
   end;

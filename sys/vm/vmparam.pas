@@ -21,6 +21,8 @@ const
  MAXPAGESIZES=3; // maximum number of supported page sizes
  IOPAGES     =2; // pages of i/o permission bitmap
 
+ pageablemem=$4C7A0000;
+
  pagesizes:array[0..2] of QWORD=(PAGE_SIZE,0,0);
 
  //Virtual memory related constants, all in bytes
@@ -48,24 +50,36 @@ const
  USRSTACK             =QWORD($007EEFFC000);  //(rng & 0xffc000) + 0x7EEFFC000
 
  SCE_USR_HEAP_START   =QWORD($00200000000);  //(rng & 0xffc000) | 0x200000000 ... (rng & 0xffc000) | 0x6ff000000
+ SCE_USR_HEAP_END     =QWORD($006FFFFC000);
  SCE_SYS_HEAP_START   =QWORD($00880000000);  //(rng & 0xffc000) | 0x880000000 ..  (rng & 0xffc000) | 0x8ff000000
 
  SCE_KERNEL_GNMDRIVER =QWORD($00FE0000000);
 
- _VM_MINUSER_ADDRESS  =QWORD($00010000000); //(original:$000000000000)
- VM_MAXUSER_ADDRESS   =QWORD($80000000000); //(original:$800000000000) [0..47] MAP_AREA_END=0xfc00000000
+ MAP_AREA_END         =QWORD($0FC00000000);
 
- VM_MIN_GPU_ADDRESS   =QWORD($90000000000);
- VM_MAX_GPU_ADDRESS   =QWORD($A0000000000); //Virtual mirror
+ //This is the minimum address without running in a separate process.
+ VM_MINGUEST_ADDRESS  =QWORD($00010000000);      //(original:$000000000000)
 
- VM_MIN_DEV_ADDRESS   =QWORD($A0000000000);
- VM_MAX_DEV_ADDRESS   =QWORD($A0000010000); //64KB
+ //This is the maximum address of the main guest
+ //memory block, which is a compromise
+ //in memory performance in Windows.
+ VM_MAXGUEST_ADDRESS  =QWORD(1) shl 41;          //(original:$800000000000)
 
- WIN_REBASE_ADDR      =QWORD($B0000000000); //fp_rebase
+ //The total memory size is 47 bits,
+ //which is equivalent to the Windows limitation,
+ //but at the end there are DLLs, so only 46 bits
+ VM_MAX_BITS          =46;
+ VM_MAXUSER_ADDRESS   =QWORD(1) shl VM_MAX_BITS; //[0..45]
 
- WIN_MAX_MOVED_STACK  =QWORD($BFFFFE00000);
- WIN_SHARED_ADDR      =QWORD($BFFFFE00000);
- KERNEL_LOWER         =QWORD($C0000000000); //should be aligned to the huge page (1GB)
+ VM_MIN_GPU_ADDRESS   =QWORD($710000000000);
+ VM_MAX_GPU_ADDRESS   =QWORD($720000000000); //Virtual mirror
+
+ VM_MIN_DEV_ADDRESS   =QWORD($720000000000);
+ VM_MAX_DEV_ADDRESS   =QWORD($720000010000); //64KB
+
+ WIN_REBASE_ADDR      =QWORD($7FF000000000); //fp_rebase
+
+ KERNEL_LOWER         =QWORD($700000000000); //should be aligned to the huge page (1GB)
 
  VM_DMEM_SIZE         =$180000000; // 6144MB
 
@@ -102,20 +116,38 @@ const
 }
 
 type
+ p_addr_range=^t_addr_range;
  t_addr_range=packed record
   start:QWORD;
   __end:QWORD;
  end;
 
+const
+ vm_findspace_ranges:array[0..11] of t_addr_range=(
+  (start:$000400000;__end:$080000000), //SCE_KERNEL_PROC_IMAGE_AREA
+  (start:$080000000;__end:$200000000), //SCE_KERNEL_DL_AREA
+  (start:$200000000;__end:$700000000), //SCE_KERNEL_HEAP_AREA
+  (start:$7E0000000;__end:$7F0000000), //SCE_KERNEL_STACK_AREA
+  (start:$7FFFFC000;__end:$800000000), //SCE_KERNEL_GBASE_AREA
+  (start:$800000000;__end:$840000000), //SCE_KERNEL_SYSTEM_DL_AREA
+  (start:$880000000;__end:$900000000), //SCE_KERNEL_SYSTEM_HEAP_AREA
+  (start:$900000000;__end:$A00000000), //SCE_KERNEL_JIT_SHM_AREA
+  (start:$A00000000;__end:$B00000000), //SCE_KERMEL_JIT_SHM_AREA2
+  (start:$F00000000;__end:$EC0000000), //SCE_KERNEL_RAZOR_GPU_AREA
+  (start:$FE0000000;__end:$FF0000000), //SCE_KERNEL_GNMDRIVER_AREA
+  (start:$FF0000000;__end:$FF0040000)  //SCE_KERNEl_GNM_TESS_AREA
+ );
+
+type
  t_addr_range_array=array[0..4] of t_addr_range;
 
 const
  initial_pmap_mem:t_addr_range_array=(
-  (start:_PROC_AREA_START_1;__end:_PROC_AREA___END  ), //guest
-  (start:DL_AREA_START     ;__end:DL_AREA___END     ), //guest
-  (start:SCE_USR_HEAP_START;__end:VM_MAXUSER_ADDRESS), //guest
-  (start:VM_MIN_GPU_ADDRESS;__end:VM_MAX_GPU_ADDRESS),
-  (start:VM_MIN_DEV_ADDRESS;__end:VM_MAX_DEV_ADDRESS)
+  (start:_PROC_AREA_START_1;__end:_PROC_AREA___END   ), //guest
+  (start:DL_AREA_START     ;__end:DL_AREA___END      ), //guest
+  (start:SCE_USR_HEAP_START;__end:VM_MAXGUEST_ADDRESS), //guest
+  (start:VM_MIN_GPU_ADDRESS;__end:VM_MAX_GPU_ADDRESS ),
+  (start:VM_MIN_DEV_ADDRESS;__end:VM_MAX_DEV_ADDRESS )
  );
 
 var
@@ -123,18 +155,12 @@ var
 
  pmap_mem_guest:array[0..2] of t_addr_range absolute pmap_mem;
 
-function pageablemem:QWORD;
 function VM_MINUSER_ADDRESS:QWORD;
 function PROC_IMAGE_AREA_START:QWORD;
 
 function is_guest_addr(addr:QWORD):Boolean;
 
 implementation
-
-function pageablemem:QWORD;
-begin
- Result:=VM_MAXUSER_ADDRESS-pmap_mem[0].start;
-end;
 
 function VM_MINUSER_ADDRESS:QWORD;
 begin

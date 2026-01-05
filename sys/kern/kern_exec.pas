@@ -43,7 +43,7 @@ uses
  vmparam,
  vm_map,
  vm_mmap,
- sys_vm_object,
+ vm_object,
  vm_pager,
  vnamei,
  vfs_lookup,
@@ -264,7 +264,7 @@ var
  error:Integer;
  vmspace:p_vmspace;
  map:vm_map_t;
- //obj:vm_object_t;
+ obj:vm_object_t;
  shared_page_base:Pointer;
  shared_page_len :QWORD;
  sv_minuser:QWORD;
@@ -345,21 +345,30 @@ begin
  shared_page_base:=vmspace^.sv_usrstack;
  shared_page_len :=p_proc.p_sysent^.sv_shared_page_len;
 
+ //create fake shared
+ obj:=vm_pager_allocate(OBJT_DEFAULT,nil,shared_page_len,0,0);
+ obj^.fakeshared:=True;
+
  //mapping shared page (sv_usrstack_len=0x4000)
- error:=vm_map_fixed(map,nil,0,
+ error:=vm_map_fixed(map,obj,0,
          QWORD(shared_page_base), shared_page_len,
          VM_PROT_RW,
          VM_PROT_RW or VM_PROT_EXECUTE,
+         0,
          MAP_INHERIT_SHARE or
          MAP_ACC_NO_CHARGE or
          MAP_COW_NO_BUDGET,
-         False,
          nil);
 
  if (error<>0) then
  begin
   Exit(error);
  end;
+
+ vm_map_set_name(map,
+                 QWORD(shared_page_base),
+                 QWORD(shared_page_base)+shared_page_len,
+                 '(NoName)SceSysCore.elf');
 
  //copy sigcode
  with p_proc.p_sysent^ do
@@ -414,7 +423,7 @@ begin
 
  if (p_proc.p_vm_container=1) then
  begin
-  error:=vm_map_wire(map,stack_addr,QWORD(vmspace^.sv_usrstack),VM_MAP_WIRE_USER or 8);
+  error:=vm_map_wire(map,stack_addr,QWORD(vmspace^.sv_usrstack),VM_MAP_WIRE_USER or VM_MAP_WIRE_LOCK);
   if (error<>0) then Exit;
  end;
 
@@ -1387,7 +1396,7 @@ begin
  if (p_proc.p_vm_container=1) then
  begin
   vm_map_lock    (p_proc.p_vmspace);
-  vm_map_modflags(p_proc.p_vmspace,MAP_WIREFUTURE or 4,0);
+  vm_map_modflags(p_proc.p_vmspace,MAP_WIREFUTURE or MAP_LOCK_WIRE,0);
   vm_map_unlock  (p_proc.p_vmspace);
  end;
 
@@ -1509,6 +1518,8 @@ begin
  vfslocked:=0;
  imgp:=@image_params;
  image_params:=Default(t_image_params);
+
+ init_system_limits;
 
  if (p_proc.p_budget_ptype=PTYPE_BIG_APP) then
  if ((g_appinfo.mmap_flags and 1)<>0) then

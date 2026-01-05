@@ -39,10 +39,10 @@ procedure vm_rem_patch_link     (_obj,vaddr:Pointer);
 implementation
 
 uses
- hamt,
+ kern_hamt,
  kern_rwlock,
  vmparam,
- sys_vm_object;
+ vm_object;
 
 type
  p_patch_page=^t_patch_page;

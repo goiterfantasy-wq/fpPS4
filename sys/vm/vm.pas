@@ -35,8 +35,8 @@ const
  VM_INHERIT_SHARE  =vm_inherit_t(0);
  VM_INHERIT_COPY   =vm_inherit_t(1);
  VM_INHERIT_NONE   =vm_inherit_t(2);
- VM_INHERIT_PATCH  =vm_inherit_t(3);
- VM_INHERIT_HOLE   =vm_inherit_t(4);
+ VM_INHERIT_PATCH  =vm_inherit_t(3); // emu ext
+ VM_INHERIT_HOLE   =vm_inherit_t(4); // emu ext
  VM_INHERIT_DEFAULT=VM_INHERIT_COPY;
 
  VM_PROT_NONE      =vm_prot_t($00);
@@ -82,13 +82,15 @@ const
  MAP_ANONYMOUS         =MAP_ANON; // For compatibility.
  MAP_SYSTEM            =$02000;
  MAP_ALLAVAILABLE      =$04000;
+ MAP_2MB_ALIGN         =$10000;
  MAP_NOCORE            =$20000;   // dont include these pages in a coredump
  MAP_PREFAULT_READ     =$40000;   // prefault mapping for reading
  MAP_SELF              =$80000;   // map decryped SELF file
 
+ MAP_OPTIMAL_SPACE     =$100000;  // VMFS_OPTIMAL_SPACE
  MAP_SANITIZER         =$200000;  // devkit only
  MAP_NO_COALESCE       =$400000;  // do not merge nearby areas
- MAP_WRITABLE_WB_GARLIC=$800000;  // allow write to WB_GARLIC
+ MAP_WRITABLE_WB_GARLIC=$800000;  // allow GPU write to WB_GARLIC
 
  MAP_ALIGNMENT_BIT  =24;
  MAP_ALIGNMENT_SHIFT=24;
@@ -121,6 +123,48 @@ const
  MADV_NOCORE    = 8; // do not include these pages in a core file
  MADV_CORE      = 9; // revert to including pages in a core file
  MADV_PROTECT   =10; // protect process from pageout kill
+
+const
+ //mtype
+ SCE_KERNEL_WB_ONION  = 0;
+ SCE_KERNEL_WC_GARLIC = 3;
+ SCE_KERNEL_WB_GARLIC =10;
+
+ //deprecated
+ SCE_KERNEL_WB_ONION_NONVOLATILE  = 1;
+ SCE_KERNEL_WC_GARLIC_VOLATILE    = 2;
+ SCE_KERNEL_WC_GARLIC_NONVOLATILE = 3;
+ SCE_KERNEL_WT_ONION_VOLATILE     = 4;
+ SCE_KERNEL_WT_ONION_NONVOLATILE  = 5;
+ SCE_KERNEL_WP_ONION_VOLATILE     = 6;
+ SCE_KERNEL_WP_ONION_NONVOLATILE  = 7;
+ SCE_KERNEL_UC_GARLIC_VOLATILE    = 8;
+ SCE_KERNEL_UC_GARLIC_NONVOLATILE = 9;
+
+const
+ SCE_KERNEL_VIRTUAL_RANGE_NAME_SIZE=32;
+ SCE_KERNEL_DMQ_FIND_NEXT=1;
+ SCE_KERNEL_VQ_FIND_NEXT =1;
+
+type
+ pSceKernelVirtualQueryInfo=^SceKernelVirtualQueryInfo;
+ SceKernelVirtualQueryInfo=packed record
+  pstart:Pointer;
+  p__end:Pointer;
+  offset:QWORD;
+  protection:Integer;
+  memoryType:Integer;
+  bits:bitpacked record
+   isFlexibleMemory:0..1; //1
+   isDirectMemory  :0..1; //2
+   isStack         :0..1; //4
+   isPooledMemory  :0..1; //8
+   isCommitted     :0..1; //16
+  end;
+  name:array[0..SCE_KERNEL_VIRTUAL_RANGE_NAME_SIZE-1] of AnsiChar;
+  align:array[0..6] of Byte;
+ end;
+ {$IF sizeof(SceKernelVirtualQueryInfo)<>72}{$STOP sizeof(SceKernelVirtualQueryInfo)<>72}{$ENDIF}
 
 function is_gpu(prot:vm_prot_t):Boolean; inline;
 function round_page(x:QWORD):QWORD; inline;

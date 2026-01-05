@@ -1051,6 +1051,7 @@ end;
 
 procedure op_invalid(var ctx:t_jit_context2);
 begin
+ //do not tell the decompiler to stop
  ctx.builder.ud2;
 end;
 
@@ -1315,6 +1316,18 @@ begin
  jit_cbs[OPPnone,OPpavgusb,OPSnone]:=@op_invalid;
  //3DNow
 
+ //AVX2
+ jit_cbs[OPPnone,OPvpbroadcast,OPSx_b   ]:=@op_invalid;
+ jit_cbs[OPPnone,OPvpbroadcast,OPSx_d   ]:=@op_invalid;
+ jit_cbs[OPPnone,OPvpbroadcast,OPSx_i128]:=@op_invalid;
+ jit_cbs[OPPnone,OPvpbroadcast,OPSx_q   ]:=@op_invalid;
+ jit_cbs[OPPnone,OPvpbroadcast,OPSx_w   ]:=@op_invalid;
+
+ jit_cbs[OPPv,OPpblend ,OPSx_d          ]:=@op_invalid;
+ jit_cbs[OPPv,OPextract,OPSx_i128       ]:=@op_invalid;
+ jit_cbs[OPPv,OPinsert ,OPSx_i128       ]:=@op_invalid;
+ //AVX2
+
  jit_cbs[OPPv,OPpextr,OPSx_b]:=@op_avx3_mri;
  jit_cbs[OPPv,OPpextr,OPSx_d]:=@op_avx3_mri;
  jit_cbs[OPPv,OPpextr,OPSx_q]:=@op_avx3_mri;
@@ -1336,11 +1349,11 @@ begin
  jit_cbs[OPPv,OPsqrt ,OPSx_sd]:=@op_avx3_gen;
  jit_cbs[OPPv,OPsqrt ,OPSx_ss]:=@op_avx3_gen;
 
- jit_cbs[OPPv,OPrsqrt,OPSx_ps]:=@op_avx2_reg_mem_wo;
- jit_cbs[OPPv,OPrsqrt,OPSx_ss]:=@op_avx3_gen;
+ jit_cbs[OPPv,OPrsqrt,OPSx_ps]:=@op_avx2_reg_mem_wo; //TODO: approximation problem for Intel/AMD
+ jit_cbs[OPPv,OPrsqrt,OPSx_ss]:=@op_avx3_gen;        //TODO: approximation problem for Intel/AMD
 
- jit_cbs[OPPv,OPrcp  ,OPSx_ps]:=@op_avx2_reg_mem_wo;
- jit_cbs[OPPv,OPrcp  ,OPSx_ss]:=@op_avx3_gen;
+ jit_cbs[OPPv,OPrcp  ,OPSx_ps]:=@op_avx2_reg_mem_wo; //TODO: approximation problem for Intel/AMD
+ jit_cbs[OPPv,OPrcp  ,OPSx_ss]:=@op_avx3_gen;        //TODO: approximation problem for Intel/AMD
 
  jit_cbs[OPPnone,OPvbroadcast,OPSx_ss  ]:=@op_avx2_reg_mem_wo;
  jit_cbs[OPPnone,OPvbroadcast,OPSx_sd  ]:=@op_avx2_reg_mem_wo;

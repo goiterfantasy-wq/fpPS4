@@ -67,6 +67,7 @@ type
   lvl_1:TsrChainLvl_1;
   lvl_0:TsrChainLvl_0;
   Flags:TsrChainFlags;
+  parent:TSpirvOp;
  end;
 
  TsrChain=class(TsrNode)
@@ -140,6 +141,7 @@ type
  PsrDataLayoutKey=^TsrDataLayoutKey;
  TsrDataLayoutKey=packed record
   offset:PtrUint;
+  mask  :PtrUint;
   rtype :TsrResourceType;
  end;
 
@@ -173,7 +175,7 @@ type
    //
   class function c(n1,n2:PsrDataLayoutKey):Integer; static;
   function  Order:Integer;
-  function  Fetch(lvl_0:PsrChainLvl_0;lvl_1:PsrChainLvl_1;cflags:Byte=0):TsrChain;
+  function  Fetch(parent:TSpirvOp;lvl_0:PsrChainLvl_0;lvl_1:PsrChainLvl_1;cflags:Byte=0):TsrChain;
   Procedure UpdateCache;
   Function  First:TsrChain;
   Function  Last :TsrChain;
@@ -218,10 +220,10 @@ type
   procedure Init(Emit:TCustomEmit);
   procedure SetUserData(pData:Pointer);
   function  pRoot:TsrDataLayout;
-  function  Fetch(p:TsrDataLayout;o:PtrUint;t:TsrResourceType;pData:Pointer):TsrDataLayout;
+  function  Fetch(p:TsrDataLayout;o,m:PtrUint;t:TsrResourceType;pData:Pointer):TsrDataLayout;
   Function  First:TsrDataLayout;
   Function  Next(node:TsrDataLayout):TsrDataLayout;
-  function  Grouping(const chain:TsrChains;rtype:TsrResourceType):TsrDataLayout;
+  function  Grouping(const chain:TsrChains;rtype:TsrResourceType;mask:PtrUint=0):TsrDataLayout;
   function  FetchImmData(size:Integer;pData:Pointer):TsrDataImm;
   function  FetchImm(pData:PDWORD;rtype:TsrResourceType):TsrDataLayout;
   function  FetchLDS():TsrDataLayout;
@@ -397,10 +399,13 @@ end;
 
 class function TsrDataLayout.c(n1,n2:PsrDataLayoutKey):Integer;
 begin
- //first offset
+ //1 offset
  Result:=ord(n1^.offset>n2^.offset)-ord(n1^.offset<n2^.offset);
  if (Result<>0) then Exit;
- //second rtype
+ //2 mask
+ Result:=ord(n1^.mask>n2^.mask)-ord(n1^.mask<n2^.mask);
+ if (Result<>0) then Exit;
+ //3 rtype
  Result:=ord(n1^.rtype>n2^.rtype)-ord(n1^.rtype<n2^.rtype);
 end;
 
@@ -413,11 +418,24 @@ begin
  end;
 end;
 
-function TsrDataLayout.Fetch(lvl_0:PsrChainLvl_0;lvl_1:PsrChainLvl_1;cflags:Byte=0):TsrChain;
+function _up_to_real(t:TsrOpBlock):TsrOpBlock;
+begin
+ repeat
+  if not t.IsType(ntOpBlock) then Break;
+  if IsReal(t.bType) then Break;
+  t:=t.Parent;
+ until false;
+ Result:=t;
+end;
+
+function TsrDataLayout.Fetch(parent:TSpirvOp;lvl_0:PsrChainLvl_0;lvl_1:PsrChainLvl_1;cflags:Byte=0):TsrChain;
 var
  _key:TsrChainKey;
 begin
+ parent:=_up_to_real(parent);
+ //
  _key:=Default(TsrChainKey);
+ _key.parent:=parent;
  //
  if (lvl_0<>nil) then
  begin
@@ -433,10 +451,21 @@ begin
  begin
   Assert((_key.lvl_1.stride<>0),'stride=0');
  end;
+
  //
  _key.Flags:=TsrChainFlags(cflags);
  //
+
  Result:=FChainTree.Find(@_key);
+
+ //search for dominance
+ while (Result=nil) and (_key.parent<>nil) do
+ begin
+  _key.parent:=_key.parent.Parent;
+  Result:=FChainTree.Find(@_key);
+ end;
+ _key.parent:=parent; //restore
+
  if (Result=nil) then
  begin
   Result:=FEmit.specialize New<TsrChain>;
@@ -630,13 +659,14 @@ begin
  Result:=FTop;
 end;
 
-function TsrDataLayoutList.Fetch(p:TsrDataLayout;o:PtrUint;t:TsrResourceType;pData:Pointer):TsrDataLayout;
+function TsrDataLayoutList.Fetch(p:TsrDataLayout;o,m:PtrUint;t:TsrResourceType;pData:Pointer):TsrDataLayout;
 var
  key:TsrDataLayoutKey;
 begin
  Assert(p<>nil);
  key:=Default(TsrDataLayoutKey);
  key.offset:=o;
+ key.mask  :=m;
  key.rtype :=t;
  //
  Result:=p.FDataTree.Find(@key);
@@ -700,7 +730,7 @@ begin
  end;
 end;
 
-function TsrDataLayoutList.Grouping(const chain:TsrChains;rtype:TsrResourceType):TsrDataLayout;
+function TsrDataLayoutList.Grouping(const chain:TsrChains;rtype:TsrResourceType;mask:PtrUint=0):TsrDataLayout;
 var
  parent:TsrDataLayout;
 begin
@@ -718,7 +748,7 @@ begin
 
  parent:=chain[0].Parent;
 
- Result:=Fetch(parent,chain[0].offset,rtype,parent.GetData);
+ Result:=Fetch(parent,chain[0].offset,mask,rtype,parent.GetData);
 end;
 
 function TsrDataLayoutList.FetchImmData(size:Integer;pData:Pointer):TsrDataImm;
@@ -760,19 +790,19 @@ begin
 
  dst:=FetchImmData(size,pData);
 
- parent:=Fetch(pRoot,dst.FImmOffset,rtImmData,dst);
+ parent:=Fetch(pRoot,dst.FImmOffset,0,rtImmData,dst);
 
- Result:=Fetch(parent,0,rtype,parent.GetData);
+ Result:=Fetch(parent,0,0,rtype,parent.GetData);
 end;
 
 function TsrDataLayoutList.FetchLDS():TsrDataLayout;
 begin
- Result:=Fetch(pRoot,0,rtLDS,nil);
+ Result:=Fetch(pRoot,0,0,rtLDS,nil);
 end;
 
 function TsrDataLayoutList.FetchGDS():TsrDataLayout;
 begin
- Result:=Fetch(pRoot,0,rtGDS,nil);
+ Result:=Fetch(pRoot,0,0,rtGDS,nil);
 end;
 
 function TsrDataLayoutList.EnumChain(cb:TChainCb):Integer;
@@ -948,11 +978,18 @@ begin
    rtTSharp4,
    rtTSharp8:
     begin
+
      //offset
      if (Writer.node.key.offset<>0) then
      begin
       Writer.HexOpt('OFS',Writer.node.key.offset);
      end;
+     //mask
+     if (Writer.node.key.mask<>0) then
+     begin
+      Writer.HexOpt('MSK',Writer.node.key.mask);
+     end;
+
     end;
    else;
   end;
@@ -1107,6 +1144,9 @@ end;
 
 class function TsrChain.c(n1,n2:PsrChainKey):Integer;
 begin
+ //0 parent
+ Result:=ord(n1^.parent.Order>n2^.parent.Order)-ord(n1^.parent.Order<n2^.parent.Order);
+ if (Result<>0) then Exit;
 
  //1 lvl_0
  Result:=TsrChainLvl_0.c(@n1^.lvl_0,@n2^.lvl_0);
@@ -1214,6 +1254,26 @@ var
  Value:TsrNode;
  dst:TsrRegNode;
  old,rtype:TsrDataType;
+
+ procedure UpdateStoreParam(Param:POpParamNode);
+ begin
+  Value:=Param.Value;
+  Value.PrepType(ord(rtype));
+
+  dst:=Value.specialize AsType<ntReg>;
+  if (dst<>nil) then
+  begin
+   old:=dst.dtype;
+   if (old<>dtUnknow) and (rtype<>old) then
+   begin
+    //OpStore <- new <- dst
+    dst:=pBitcastList^.FetchRead(rtype,dst);
+    Param.Value:=dst;
+   end;
+  end;
+ end;
+
+
 begin
  rtype:=Fdtype;
 
@@ -1249,37 +1309,29 @@ begin
      end;
     end;
 
-   Op.OpStore,
-   Op.OpAtomicStore,
-   Op.OpAtomicExchange,
-   Op.OpAtomicCompareExchange,
-   Op.OpAtomicCompareExchangeWeak,
-   Op.OpAtomicIIncrement,
-   Op.OpAtomicIDecrement,
-   Op.OpAtomicIAdd,
-   Op.OpAtomicISub,
-   Op.OpAtomicSMin,
-   Op.OpAtomicUMin,
-   Op.OpAtomicSMax,
-   Op.OpAtomicUMax,
-   Op.OpAtomicAnd,
-   Op.OpAtomicOr,
-   Op.OpAtomicXor:
-    begin
-     Value:=pLine.ParamNode(1).Value;
-     Value.PrepType(ord(rtype));
+   Op.OpStore:
+    UpdateStoreParam(pLine.ParamNode(1));
 
-     dst:=Value.specialize AsType<ntReg>;
-     if (dst<>nil) then
-     begin
-      old:=dst.dtype;
-      if (old<>dtUnknow) and (rtype<>old) then
-      begin
-       //OpStore <- new <- dst
-       dst:=pBitcastList^.FetchRead(rtype,dst);
-       pLine.ParamNode(1).Value:=dst;
-      end;
-     end;
+   Op.OpAtomicStore   ,
+   Op.OpAtomicExchange,
+   Op.OpAtomicIAdd    ,
+   Op.OpAtomicISub    ,
+   Op.OpAtomicSMin    ,
+   Op.OpAtomicUMin    ,
+   Op.OpAtomicSMax    ,
+   Op.OpAtomicUMax    ,
+   Op.OpAtomicAnd     ,
+   Op.OpAtomicOr      ,
+   Op.OpAtomicXor     ,
+   Op.OpAtomicFMinEXT ,
+   Op.OpAtomicFMaxEXT :
+    UpdateStoreParam(pLine.ParamNode(3));
+
+   Op.OpAtomicCompareExchange    ,
+   Op.OpAtomicCompareExchangeWeak:
+    begin
+     UpdateStoreParam(pLine.ParamNode(4));
+     UpdateStoreParam(pLine.ParamNode(5));
     end;
 
    else;

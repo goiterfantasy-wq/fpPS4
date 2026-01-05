@@ -28,6 +28,8 @@ type
   FConfInfo:TConfigInfo;
   FGameItem:TGameItem;
   FParamSfo:TParamSfoFile;
+
+  FLoadExec:Boolean;
  end;
 
  TGameProcessSimple=class(TGameProcess)
@@ -108,6 +110,9 @@ uses
  ps4_libSceAjm,
  ps4_libSceCompanionUtil,
  ps4_libSceAutoMounterClient,
+ ps4_libSceHmd,
+ ps4_libSceVrTracker,
+ ps4_libSceAudio3d,
  //internal libs
 
  kern_rtld,
@@ -197,6 +202,11 @@ begin
  ps4_libSceSystemService.FDateFormat  :=ConfInfo.PS4SystemService.DateFormat;
  ps4_libSceSystemService.FTimeFormat  :=ConfInfo.PS4SystemService.TimeFormat;
  ps4_libSceSystemService.FButtonAssign:=ConfInfo.PS4SystemService.ButtonAssign;
+
+ ps4_libSceAudioOut.FMainDevice      :=ConfInfo.PS4Audio.MainDevice;
+ ps4_libSceAudioOut.FHeadphoneDevice :=ConfInfo.PS4Audio.HeadphoneDevice;
+ ps4_libSceAudioOut.FControllerDevice:=ConfInfo.PS4Audio.ControllerDevice;
+ ps4_libSceAudioOut.FSpecialDevice   :=ConfInfo.PS4Audio.SpecialDevice;
 end;
 
 procedure free_params(argv:PPChar);
@@ -369,6 +379,7 @@ var
  argv:PPChar;
  i,argc:Integer;
  Item:TGameItem;
+ LoadExec:Boolean;
 begin
  //re_init_tty;
  //init_tty:=@re_init_tty;
@@ -394,7 +405,7 @@ begin
  g_appinfo.mmap_flags      :=1; //is_big_app ???
  g_appinfo.attributeExe    :=GameStartupInfo.ATTRIBUTE_EXE;
  g_appinfo.attribute2      :=GameStartupInfo.ATTRIBUTE2;
- g_appinfo.CUSANAME        :=GameStartupInfo.TITLE;
+ g_appinfo.CUSANAME        :=GameStartupInfo.TITLE_ID;
  g_appinfo.requiredHdcpType:=GameStartupInfo.RequiredHdcpType;
  g_appinfo.attribute       :=GameStartupInfo.ATTRIBUTE;
  g_appinfo.hasParamSfo     :=GameStartupInfo.hasParamSfo;
@@ -427,6 +438,8 @@ begin
  begin
   kern_reserve_2mb_page(GameStartupInfo.SELF_2MIB_PAGE_AMOUNT,mode);
  end;
+
+ LoadExec:=GameStartupInfo.LoadExec;
 
  Writeln('Name    :',Item.FGameInfo.Name      );
  Writeln('TitleId :',Item.FGameInfo.TitleId   );
@@ -478,12 +491,20 @@ begin
  end else
  if (err<>0) then
  begin
-  print_error_td('[execve error]'+#13#10+
-                 ' cmd:"'+argv[0]+'"'#13#10+
-                 ' err:'+get_errno_str(err)
-                ,False);
+  if not LoadExec then
+  begin
+   print_error_td('[execve error]'+#13#10+
+                  ' cmd:"'+argv[0]+'"'#13#10+
+                  ' err:'+get_errno_str(err)
+                 ,False);
+
+   exit1(W_EXITCODE(err, SIGABRT));
+  end else
+  begin
+   exit1(0);
+  end;
   //
-  exit1(W_EXITCODE(err, SIGABRT));
+
  end;
  //
 
@@ -553,7 +574,7 @@ begin
  mem.Free;
 
  //free shared
- md_fork_unshare;
+ FreeMem(data);
 
  parent:=md_pidfd_open(md_getppid);
 
@@ -661,6 +682,7 @@ begin
  GameStartupInfo:=TGameStartupInfo.Create(False);
  GameStartupInfo.FConfInfo:=cfg.FConfInfo;
  GameStartupInfo.FGameItem:=cfg.FGameItem;
+ GameStartupInfo.LoadExec :=cfg.FLoadExec;
 
  GameStartupInfo.LocalDir   :=GetAppConfigDir(False);
  GameStartupInfo.Category   :='gd'; //m_type = SCE_LNC_APP_TYPE_BIG_APP;
@@ -672,6 +694,7 @@ begin
 
   GameStartupInfo.CATEGORY             :=cfg.FParamSfo.GetString('CATEGORY');
   GameStartupInfo.TITLE                :=cfg.FParamSfo.GetString('TITLE');
+  GameStartupInfo.TITLE_ID             :=cfg.FParamSfo.GetString('TITLE_ID');
   GameStartupInfo.CONTENT_ID           :=cfg.FParamSfo.GetString('CONTENT_ID');
   GameStartupInfo.INSTALL_DIR_SAVEDATA :=cfg.FParamSfo.GetString('INSTALL_DIR_SAVEDATA');
   GameStartupInfo.APP_VER              :=cfg.FParamSfo.GetString('APP_VER');

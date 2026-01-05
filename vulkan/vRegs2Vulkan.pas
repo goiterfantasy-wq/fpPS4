@@ -16,6 +16,7 @@ uses
  vShader,
  ps4_shader,
  pm4defs,
+ pm4_context,
  si_ci_vi_merged_offset,
  si_ci_vi_merged_enum,
  si_ci_vi_merged_registers,
@@ -95,12 +96,15 @@ type
 
  PGPU_USERDATA=^TGPU_USERDATA;
 
+ //interface
  PGPU_REGS=^TGPU_REGS;
  TGPU_REGS=packed object
   SG_REG:PSH_REG_GFX_GROUP;     // 0x2C00
   SC_REG:PSH_REG_COMPUTE_GROUP; // 0x2E00
   CX_REG:PCONTEXT_REG_GROUP;    // 0xA000
   UC_REG:PUSERCONFIG_REG_SHORT; // 0xC000
+
+  SDP:p_shader_draw_params;
 
   Function  _SHADER_MASK(i:Byte):Byte; inline;  //0..7
   Function  _TARGET_MASK(i:Byte):Byte; inline;  //0..7
@@ -926,6 +930,7 @@ begin
     NUMBER_SNORM:Result:=VK_FORMAT_R8_SNORM;
     NUMBER_UINT :Result:=VK_FORMAT_R8_UINT;
     NUMBER_SINT :Result:=VK_FORMAT_R8_SINT;
+    NUMBER_SRGB :Result:=VK_FORMAT_R8_SRGB;
     else;
    end;
   COLOR_8_8:
@@ -2160,8 +2165,7 @@ begin
   IMG_DATA_FORMAT_RESERVED_28,
   IMG_DATA_FORMAT_RESERVED_29,
   IMG_DATA_FORMAT_RESERVED_30,
-  IMG_DATA_FORMAT_RESERVED_31,
-  IMG_DATA_FORMAT_1_REVERSED :
+  IMG_DATA_FORMAT_RESERVED_31:
    Exit(VK_FORMAT_UNDEFINED);
   else;
  end;
@@ -2432,7 +2436,7 @@ begin
 
  if _img_is_msaa(PT^._type) then
  begin
-  Result.params.samples  :=PT^.last_level+1;
+  Result.params.samples  :=1 shl PT^.last_level;
   Result.params.mipLevels:=1;
  end else
  begin
@@ -2452,7 +2456,8 @@ function _get_tsharp8_image_info(PT:PTSharpResource8;hint:s_image_usage):TvImage
 begin
  Result:=_get_tsharp4_image_info(PTSharpResource4(PT),hint);
  //
- Result.params.pitch:=PT^.pitch+1;
+ Result.params.pitch    :=PT^.pitch+1;
+ Result.params.pad_width:=Result.params.pitch;
  //
  if (p_neomode<>0) then
  begin

@@ -7,6 +7,7 @@ interface
 
 uses
  mqueue,
+ uma,
  kern_param,
  time,
  sys_event,
@@ -70,8 +71,14 @@ const
  MNT_SNAPSHOT =$0000000001000000; // snapshot the filesystem
  MNT_BYFSID   =$0000000008000000; // specify filesystem by ID.
 
+ //emu ext
  MNT_EMU_PFS  =$0000000200000000; // emulate PFS
 
+ //emu ext
+ MNT_BIG_APP  =$0000001000000000;
+ MNT_MINI_APP =$0000002000000000;
+ MNT_SYSTEM   =$0000003000000000;
+ MNT_BUDGET   =$0000003000000000;
 
  MNT_VISFLAGMASK=(MNT_RDONLY or MNT_SYNCHRONOUS or MNT_NOEXEC or
     MNT_NOSUID or MNT_UNION or MNT_SUJ or
@@ -367,6 +374,7 @@ type
   mnt_explock            :mtx         ;// vfs_export walkers lock
   mnt_upper_link         :TAILQ_ENTRY ;// (m) we in the all uppers
   mnt_uppers             :TAILQ_HEAD  ;// (m) upper mounts over us
+  mnt_budget_id          :Integer     ;
  end;
 
  //Generic file handle
@@ -382,8 +390,9 @@ const
  VFS_VERSION=$19660120;
 
 var
+ mount_zone   :uma_zone_t;
  mountlist_mtx:mtx;
- mountlist:TAILQ_HEAD=(tqh_first:nil;tqh_last:@mountlist.tqh_first);
+ mountlist    :TAILQ_HEAD=(tqh_first:nil;tqh_last:@mountlist.tqh_first);
 
  VFS_Giant:mtx;
 

@@ -414,7 +414,7 @@ type
   procedure _RM     (const desc:t_op_type;reg:TRegValue;mem:t_jit_leas);
   procedure _RMI    (const desc:t_op_type;reg:TRegValue;mem:t_jit_leas;imm:Int64);
   procedure _RMI8   (const desc:t_op_type;reg:TRegValue;mem:t_jit_leas;imm:Byte);
-  procedure _RR     (const desc:t_op_type;reg0,reg1:TRegValue;size:TOperandSize=os0);
+  procedure _RR     (const desc:t_op_type;reg0,reg1:TRegValue;RM:Boolean);
   procedure _RRI    (const desc:t_op_type;reg0,reg1:TRegValue;imm:Int64;size:TOperandSize=os0);
   procedure _RRI8   (const desc:t_op_type;reg0,reg1:TRegValue;imm:Byte;size:TOperandSize=os0);
   procedure _R      (const desc:t_op_type;reg:TRegValue);
@@ -452,6 +452,8 @@ type
   procedure subi    (reg:TRegValue  ;imm:Int64);
   procedure subi8se (reg:TRegValue  ;imm:ShortInt);
   procedure subi8se (mem:t_jit_leas ;imm:ShortInt);
+  procedure mulq    (reg:TRegValue);
+  procedure mulq    (mem:t_jit_leas);
   procedure shl_cl  (reg:TRegValue);
   procedure shr_cl  (reg:TRegValue);
   procedure shli8   (reg:TRegValue  ;imm:Byte);
@@ -510,6 +512,9 @@ type
   procedure lahf;
   procedure saxf;
   procedure laxf;
+  procedure cpuid;
+  procedure rdtsc;
+  procedure lfence;
   procedure cli;
   procedure sti;
   procedure seto(reg:TRegValue);
@@ -1371,13 +1376,13 @@ begin
  case ptr[0] of
   $0F:
       case ptr[1] of
-       $80..$8F:Result:=Result or MOP_JCC or (ptr[1] and $F); //jcc_32
+       $80..$8F:Result:=Result or MOP_JCC or (ptr[1] and Byte($F)); //jcc_32
        else;
       end;
-  $70..$7F:Result:=Result or MOP_JCC or (ptr[0] and $F);      //jcc_8
-  $E0..$E3:Result:=Result or MOP_JCX or (ptr[0] and $3);      //jcx_8/32
-       $EB:Result:=Result or MOP_JMP;                         //jmp_8
-       $E9:Result:=Result or MOP_JMP;                         //jmp_32
+  $70..$7F:Result:=Result or MOP_JCC or (ptr[0] and Byte($F));      //jcc_8
+  $E0..$E3:Result:=Result or MOP_JCX or (ptr[0] and Byte($3));      //jcx_8/32
+       $EB:Result:=Result or MOP_JMP;                               //jmp_8
+       $E9:Result:=Result or MOP_JMP;                               //jmp_32
   else;
  end;
 end;
@@ -2218,6 +2223,7 @@ begin
         begin
          if ((mop and MT_32BIT)<>0) then
          begin
+          //32 -> 8
           case (mop and MOP_ANY) of
            MOP_JMP:
             begin
@@ -2239,13 +2245,35 @@ begin
             end;
            else;
           end;
+          //32 -> 8
          end;
         end else
         begin
          if ((mop and MT_32BIT)=0) then
          begin
-          //8 -> 32???
-          Assert(False,'TODO: Link data [8 -> 32]');
+          //8 -> 32
+          case (mop and MOP_ANY) of
+           MOP_JMP:
+            begin
+             //jmp_8->jmp_32
+             m_jmp_32();
+             is_change:=True;
+            end;
+           MOP_JCC:
+            begin
+             //jcc_8->jcc_32
+             m_jcc_32(mop);
+             is_change:=True;
+            end;
+           MOP_JCX:
+            begin
+             //jcx_8->jcx_32
+             m_jcx_32(mop);
+             is_change:=True;
+            end;
+           else;
+          end;
+          //8 -> 32
          end;
         end;
 
@@ -3030,8 +3058,9 @@ begin
  _add(ji);
 end;
 
-procedure t_jit_builder._RR(const desc:t_op_type;reg0,reg1:TRegValue;size:TOperandSize=os0);
+procedure t_jit_builder._RR(const desc:t_op_type;reg0,reg1:TRegValue;RM:Boolean);
 var
+ size:TOperandSize;
  modrm_info:t_modrm_info;
 
  op:DWORD;
@@ -3051,9 +3080,16 @@ begin
  Assert(reg0.AScale<=1);
  Assert(reg1.AScale<=1);
 
- if (size=os0) then
+ //RM + R -> reg0 | 1 xor 1 = 0
+ //MR + R -> reg1 | 1 xor 0 = 1
+ //RM + M -> reg1 | 0 xor 1 = 1
+ //MR + M -> reg0 | 0 xor 0 = 0
+
+ if (reg_size_pri in desc.opt) xor RM then
  begin
-  Assert(reg0.ASize=reg1.ASize);
+  size:=reg1.ASize;
+ end else
+ begin
   size:=reg0.ASize;
  end;
 
@@ -3084,7 +3120,13 @@ begin
 
  modrm_info:=Default(t_modrm_info);
 
- modrm_info.build_rr(reg0,reg1);
+ if RM then
+ begin
+  modrm_info.build_rr(reg1,reg0); //swapped
+ end else
+ begin
+  modrm_info.build_rr(reg0,reg1);
+ end;
 
  if (Prefix<>0) then
  begin
@@ -3123,8 +3165,13 @@ begin
 
  if (size=os0) then
  begin
-  Assert(reg0.ASize=reg1.ASize);
-  size:=reg0.ASize;
+  if (reg_size_pri in desc.opt) then
+  begin
+   size:=reg1.ASize;
+  end else
+  begin
+   size:=reg0.ASize;
+  end;
  end;
 
  ji:=default_jit_instruction;
@@ -3199,8 +3246,13 @@ begin
 
  if (size=os0) then
  begin
-  Assert(reg0.ASize=reg1.ASize);
-  size:=reg0.ASize;
+  if (reg_size_pri in desc.opt) then
+  begin
+   size:=reg1.ASize;
+  end else
+  begin
+   size:=reg0.ASize;
+  end;
  end;
 
  ji:=default_jit_instruction;
@@ -3856,7 +3908,7 @@ begin
  desc:=Default(t_op_type);
  desc.op:=$0F00 or CMOV_8[op];
 
- _RR(desc,reg1,reg0,os0);
+ _RR(desc,reg0,reg1,True);
 end;
 
 ////
@@ -4006,7 +4058,7 @@ procedure t_jit_builder.movq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$89;index:0);
 begin
- _RR(desc,reg0,reg1,os0);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.movi(mem:t_jit_leas;imm:Int64);
@@ -4162,7 +4214,7 @@ procedure t_jit_builder.addq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$01;index:0);
 begin
- _RR(desc,reg0,reg1);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.addi(reg:TRegValue;imm:Int64);
@@ -4206,7 +4258,7 @@ procedure t_jit_builder.subq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$29;index:0);
 begin
- _RR(desc,reg0,reg1);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.subi(reg:TRegValue;imm:Int64);
@@ -4228,6 +4280,20 @@ const
  desc:t_op_type=(op:$83;index:5);
 begin
  _MI8(desc,mem,imm);
+end;
+
+procedure t_jit_builder.mulq(reg:TRegValue);
+const
+ desc:t_op_type=(op:$F7;index:4);
+begin
+ _R(desc,reg);
+end;
+
+procedure t_jit_builder.mulq(mem:t_jit_leas);
+const
+ desc:t_op_type=(op:$F7;index:4);
+begin
+ _M(desc,mem);
 end;
 
 ///
@@ -4294,7 +4360,7 @@ procedure t_jit_builder.andq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$21;index:0);
 begin
- _RR(desc,reg0,reg1);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.ori(reg:TRegValue;imm:Int64);
@@ -4329,14 +4395,14 @@ procedure t_jit_builder.orq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$09;index:0);
 begin
- _RR(desc,reg0,reg1);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.xorq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$31;index:0);
 begin
- _RR(desc,reg0,reg1);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.notq(reg:TRegValue);
@@ -4373,7 +4439,7 @@ procedure t_jit_builder.cmpq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$39;index:0);
 begin
- _RR(desc,reg0,reg1);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.cmpi(reg:TRegValue;imm:Int64);
@@ -4408,7 +4474,7 @@ procedure t_jit_builder.xchgq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$87;index:0);
 begin
- _RR(desc,reg0,reg1);
+ _RR(desc,reg0,reg1,False);
 end;
 
 ///
@@ -5511,6 +5577,21 @@ begin
  lahf;
 end;
 
+procedure t_jit_builder.cpuid;
+begin
+ _O($0FA2);
+end;
+
+procedure t_jit_builder.rdtsc;
+begin
+ _O($0F31);
+end;
+
+procedure t_jit_builder.lfence;
+begin
+ _O($0FAEE8);
+end;
+
 procedure t_jit_builder.cli;
 begin
  _O($FA);
@@ -5537,7 +5618,7 @@ procedure t_jit_builder.testq(reg0:TRegValue;reg1:TRegValue);
 const
  desc:t_op_type=(op:$85;index:0);
 begin
- _RR(desc,reg0,reg1,os0);
+ _RR(desc,reg0,reg1,False);
 end;
 
 procedure t_jit_builder.bti8(mem:t_jit_leas;imm:Byte);
@@ -5569,7 +5650,7 @@ procedure t_jit_builder.movqx(reg0,reg1:TRegValue);
 const
  desc:t_op_type=(op:$660F7E;index:0);
 begin
- _RR(desc,reg0,reg1,reg0.ASize); //66 REX.W 0F 7E /r MOVQ r/m64, xmm
+ _RR(desc,reg0,reg1,False); //66 REX.W 0F 7E /r MOVQ r/m64, xmm
 end;
 
 procedure t_jit_builder.pinsrq(reg0,reg1:TRegValue;imm8:Byte);

@@ -8,7 +8,7 @@ interface
 const
  AF_INET = 2;
  AF_INET6=28;
-
+ 
  SCE_NET_EINVAL      =22;
  SCE_NET_ENOSPC      =28;
  SCE_NET_EWOULDBLOCK =35;

@@ -16,7 +16,7 @@ uses
  kern_jit_ctx;
 
 var
- _SSE4aSupport:Boolean=False;
+ _SSE4aSupport:Boolean=False; public;
 
 procedure _ins_op(var op:DWORD;i:Byte); inline;
 begin
@@ -44,6 +44,32 @@ begin
  _ins_op(desc.reg_im8.op,i);
 end;
 
+function get_reg_prio(OpCode:TFullOpcode):t_op_opt; inline;
+begin
+ Result:=[];
+ if (OpCode.Prefix=OPPnone) then
+  case OpCode.Opcode of
+   OPcvtsd2 ,
+   OPcvtss2 ,
+   OPcvttsd2,
+   OPcvttss2:
+    case OpCode.Suffix of
+     OPSx_si:Result:=[reg_size_pri];
+     else;
+    end;
+   else;
+  end;
+end;
+
+procedure _set_reg_prio(var desc:t_op_desc;OpCode:TFullOpcode); inline;
+var
+ i:t_op_opt;
+begin
+ i:=get_reg_prio(OpCode);
+ desc.mem_reg.opt:=desc.mem_reg.opt+i;
+ desc.reg_mem.opt:=desc.reg_mem.opt+i;
+end;
+
 procedure op_emit2_simd(var ctx:t_jit_context2;const desc:t_op_desc);
 var
  tmp:t_op_desc;
@@ -58,6 +84,8 @@ begin
   else
     Assert(False);
  end;
+
+ _set_reg_prio(tmp,ctx.din.OpCode);
 
  op_emit2(ctx,tmp);
 end;
@@ -894,12 +922,21 @@ begin
 end;
 
 //REX.W
-//CVTSD2SI
-//CVTSI2SD
-//CVTSI2SS
-//CVTSS2SI
-//CVTTSD2SI
-//CVTTSS2SI
+
+//LZCNT      [r16] [r32] [r64], r/m64
+
+//MOVSX      [r16] [r32] [r64], r/m8
+//MOVSX      [r32] [r64], r/m16
+//MOVSXD     [r16] [r32] [r64], r/m32
+//MOVZX      [r16] [r32] [r64], r/m8
+//MOVZX      [r32] [r64], r/m16
+
+//CVTSD2SI   [r32] [r64], xmm1/m64         R
+//CVTSI2SD          xmm1, [r/m64]  [r/m32] M
+//CVTSI2SS          xmm1, [r/m64]  [r/m32] M
+//CVTSS2SI   [r32] [r64], xmm1/m32         R
+//CVTTSD2SI  [r32] [r64], xmm1/m64         R
+//CVTTSS2SI  [r32] [r64], xmm1/m32         R
 
 //
 
@@ -996,6 +1033,10 @@ begin
 
  jit_cbs[OPPnone,OPpand ,OPSnone]:=@op_reg_mem_rw;
  jit_cbs[OPPnone,OPpandn,OPSnone]:=@op_reg_mem_rw;
+
+ jit_cbs[OPPnone,OPpblend,OPSx_w ]:=@op_reg_mem_rw;
+ jit_cbs[OPPnone,OPblendv,OPSx_ps]:=@op_reg_mem_rw;
+ jit_cbs[OPPnone,OPblendv,OPSx_pd]:=@op_reg_mem_rw;
 
  jit_cbs[OPPnone,OPpcmpeq,OPSx_b ]:=@op_reg_mem_rw;
  jit_cbs[OPPnone,OPpcmpeq,OPSx_w ]:=@op_reg_mem_rw;
@@ -1125,11 +1166,11 @@ begin
  jit_cbs[OPPnone,OPsqrt,OPSx_sd]:=@op_reg_mem_wo;
  jit_cbs[OPPnone,OPsqrt,OPSx_ss]:=@op_reg_mem_wo;
 
- jit_cbs[OPPnone,OPrsqrt,OPSx_ps]:=@op_reg_mem_wo;
- jit_cbs[OPPnone,OPrsqrt,OPSx_ss]:=@op_reg_mem_wo;
+ jit_cbs[OPPnone,OPrsqrt,OPSx_ps]:=@op_reg_mem_wo; //TODO: approximation problem for Intel/AMD
+ jit_cbs[OPPnone,OPrsqrt,OPSx_ss]:=@op_reg_mem_wo; //TODO: approximation problem for Intel/AMD
 
- jit_cbs[OPPnone,OPrcp ,OPSx_ps]:=@op_reg_mem_wo;
- jit_cbs[OPPnone,OPrcp ,OPSx_ss]:=@op_reg_mem_wo;
+ jit_cbs[OPPnone,OPrcp ,OPSx_ps]:=@op_reg_mem_wo;  //TODO: approximation problem for Intel/AMD
+ jit_cbs[OPPnone,OPrcp ,OPSx_ss]:=@op_reg_mem_wo;  //TODO: approximation problem for Intel/AMD
 
  jit_cbs[OPPnone,OPpshuf,OPSx_b ]:=@op_reg_mem_rw;
  jit_cbs[OPPnone,OPpshuf,OPSx_d ]:=@op_reg_mem_rw;

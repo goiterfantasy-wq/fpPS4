@@ -80,6 +80,12 @@ type
   FCurrBinds   :array[BP_GRAPHICS..BP_COMPUTE] of PvDescriptorCache;
   FCurrGroup   :array[BP_GRAPHICS..BP_COMPUTE] of TvDescriptorGroup;
 
+  FCurrIndexBuffer:record
+   buffer   :TVkBuffer;
+   offset   :TVkDeviceSize;
+   indexType:TVkIndexType;
+  end;
+
   FDescriptorCacheSet:TvDescriptorCacheSet;
 
   FRenderPass:TVkRenderPass;
@@ -127,6 +133,7 @@ type
   Procedure   DispatchDirect(X,Y,Z:TVkUInt32);
   Procedure   DispatchIndirect(BASE:Pointer;Offset:DWORD);
 
+  Procedure   BindIndexBuffer(buffer:TVkBuffer;offset:TVkDeviceSize;indexType:TVkIndexType);
   Procedure   BindVertexBuffers(const FAttrBuilder:TvAttrBuilder);
   Procedure   SetVertexInput(const FAttrBuilder:TvAttrBuilder);
 
@@ -211,8 +218,11 @@ type
   Procedure   WriteEos(eventType:Byte;dst:Pointer;value:DWORD;isBlocking:Boolean);
   Procedure   WriteEvent(eventType:Byte);
 
-  Procedure   DrawIndexOffset2(IndexBase:Pointer;indexOffset,vertexOffset,indexCount:DWORD);
-  Procedure   DrawIndexAuto   (vertexOffset,indexCount:DWORD);
+  Procedure   DrawIndexOffset2 (IndexBase:Pointer;indexOffset,vertexOffset,indexCount:DWORD);
+  Procedure   DrawIndexAuto    (vertexOffset,indexCount:DWORD);
+  Procedure   DrawIndexIndirect(IndexBase:Pointer;indexOffset,vertexOffset,indexCount:DWORD;
+                                indirectBase,countAddr:Pointer;
+                                dataOffset,stride,count:DWORD);
  end;
 
 implementation
@@ -939,6 +949,34 @@ begin
  vkCmdDispatchIndirect(FCmdbuf,rb.FHandle,BufOffset);
 end;
 
+Procedure TvCustomCmdBuffer.BindIndexBuffer(buffer:TVkBuffer;offset:TVkDeviceSize;indexType:TVkIndexType);
+begin
+ if (Self=nil) then
+ begin
+  Writeln(stderr,'Self=nil,',{$I %LINE%});
+  Exit;
+ end;
+
+ if (FCurrIndexBuffer.buffer   =buffer   ) and
+    (FCurrIndexBuffer.offset   =offset   ) and
+    (FCurrIndexBuffer.indexType=indexType) then
+ begin
+  Exit;
+ end;
+
+ Inc(cmd_count);
+
+ vkCmdBindIndexBuffer(
+     Fcmdbuf,
+     buffer,
+     offset,
+     indexType);
+
+ FCurrIndexBuffer.buffer   :=buffer;
+ FCurrIndexBuffer.offset   :=offset;
+ FCurrIndexBuffer.indexType:=indexType;
+end;
+
 Procedure TvCustomCmdBuffer.BindVertexBuffers(const FAttrBuilder:TvAttrBuilder);
 var
  i,c:Integer;
@@ -1610,7 +1648,7 @@ end;
 
 Procedure TvCmdBuffer.DrawIndexOffset2(IndexBase:Pointer;indexOffset,vertexOffset,indexCount:DWORD);
 var
- rb:TvHostBuffer;
+ IndexBuffer:TvHostBuffer;
  Size:TVkDeviceSize;
  BufOffset:TVkDeviceSize;
  i,h:DWORD;
@@ -1633,20 +1671,17 @@ begin
 
  Size:=(indexOffset+indexCount)*GET_INDEX_TYPE_SIZE(FINDEX_TYPE);
 
- rb:=FetchHostBuffer(Self,QWORD(IndexBase),Size);
- Assert(rb<>nil);
+ IndexBuffer:=FetchHostBuffer(Self,QWORD(IndexBase),Size);
+ Assert(IndexBuffer<>nil);
 
  Inc(cmd_count);
 
- BufOffset:=QWORD(IndexBase)-rb.FAddr;
+ BufOffset:=QWORD(IndexBase)-IndexBuffer.FAddr;
 
- vkCmdBindIndexBuffer(
-     Fcmdbuf,
-     rb.FHandle,
+ BindIndexBuffer(
+     IndexBuffer.FHandle,
      BufOffset,
      FINDEX_TYPE);
-
- Inc(cmd_count);
 
  Case Femulate_primtype of
   0:
@@ -1787,6 +1822,87 @@ begin
      Assert(false,'TODO');
     end;
  end;
+
+end;
+
+Procedure TvCmdBuffer.DrawIndexIndirect(IndexBase:Pointer;indexOffset,vertexOffset,indexCount:DWORD;
+                                        indirectBase,countAddr:Pointer;
+                                        dataOffset,stride,count:DWORD);
+var
+ IndexBuffer:TvHostBuffer;
+ IndexBuffer_offset:TVkDeviceSize;
+ IndirectBuffer:TvHostBuffer;
+ IndirectBuffer_offset:TVkDeviceSize;
+ Count_buffer:TvHostBuffer;
+ Count_buffer_offset:TVkDeviceSize;
+begin
+
+ if (Self=nil) then
+ begin
+  Writeln(stderr,'Self=nil,',{$I %LINE%});
+  Exit;
+ end;
+
+ ASSERT(sizeof(TVkDrawIndexedIndirectCommand) = stride);
+
+ if (FRenderPass=VK_NULL_HANDLE) then Exit;
+ if (FCurrPipeline[BP_GRAPHICS]=VK_NULL_HANDLE) then Exit;
+
+ if (not BeginCmdBuffer) then Exit;
+
+ Assert(Femulate_primtype=0);
+ Assert(indexOffset=0);
+ Assert(vertexOffset=0);
+
+ ApplyDescriptorCache(BP_GRAPHICS);
+
+ IndexBuffer:=FetchHostBuffer(Self,QWORD(IndexBase),(indexOffset+indexCount)*GET_INDEX_TYPE_SIZE(FINDEX_TYPE));
+ Assert(IndexBuffer<>nil);
+
+ IndexBuffer_offset:=QWORD(IndexBase)-IndexBuffer.FAddr;
+
+ BindIndexBuffer(
+     IndexBuffer.FHandle,
+     IndexBuffer_offset,
+     FINDEX_TYPE);
+
+ IndirectBuffer:=FetchHostBuffer(Self,QWORD(indirectBase) + dataOffset,stride * count);
+ Assert(IndirectBuffer<>nil);
+
+ IndirectBuffer_offset:=(QWORD(indirectBase) + dataOffset)-IndirectBuffer.FAddr;
+
+ if (countAddr<>nil) then
+ begin
+
+  Count_buffer:=FetchHostBuffer(Self,QWORD(countAddr),4);
+  Assert(Count_buffer<>nil);
+
+  Count_buffer_offset:=QWORD(countAddr)-Count_buffer.FAddr;
+
+  if (vkCmdDrawIndexedIndirectCountKHR=nil) then
+  begin
+   Pointer(vkCmdDrawIndexedIndirectCountKHR):=vkGetInstanceProcAddr(VulkanApp.FInstance,'vkCmdDrawIndexedIndirectCountKHR');
+  end;
+
+  vkCmdDrawIndexedIndirectCountKHR(
+    Fcmdbuf,
+    IndirectBuffer.FHandle,
+    IndirectBuffer_offset,
+    Count_buffer.FHandle,
+    Count_buffer_offset,
+    count,
+    stride);
+ end else
+ begin
+  vkCmdDrawIndexedIndirect(
+    Fcmdbuf,
+    IndirectBuffer.FHandle,
+    IndirectBuffer_offset,
+    count,
+    stride);
+ end;
+
+ Inc(cmd_count);
 
 end;
 

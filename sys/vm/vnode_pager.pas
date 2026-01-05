@@ -9,14 +9,14 @@ uses
  vnode,
  vm,
  vmparam,
- sys_vm_object;
+ vm_object;
 
 function  vnode_pager_alloc(handle:Pointer;
-                            size:vm_ooffset_t;
-                            prot:vm_prot_t;
+                            size  :vm_ooffset_t;
+                            prot  :vm_prot_t;
                             offset:vm_ooffset_t):vm_object_t;
 
-function  vnode_create_vobject(vp:p_vnode;isize:vm_ooffset_t):Integer;
+function  vnode_create_vobject(vp:p_vnode;isize:vm_ooffset_t;budget_id:Integer):Integer;
 
 procedure vnode_destroy_vobject(vp:p_vnode);
 
@@ -33,14 +33,6 @@ uses
  systm,
  kern_param,
  kern_mtx;
-
-//
-
-procedure vm_object_terminate(obj:vm_object_t); external;
-procedure vm_pager_deallocate(obj:vm_object_t); external;
-procedure vm_object_pip_wait(obj:vm_object_t;waitid:pchar); external;
-
-//
 
 function IDX_TO_OFF(x:QWORD):QWORD; inline;
 begin
@@ -60,8 +52,8 @@ end;
  }
 
 function vnode_pager_alloc(handle:Pointer;
-                           size:vm_ooffset_t;
-                           prot:vm_prot_t;
+                           size  :vm_ooffset_t;
+                           prot  :vm_prot_t;
                            offset:vm_ooffset_t):vm_object_t;
 label
  retry;
@@ -103,7 +95,7 @@ retry:
    }
   obj:=vm_object_allocate(OBJT_VNODE, OFF_TO_IDX(round_page(size)));
 
-  obj^.un_pager.vnp.vnp_size:=size;
+  obj^.un_pager.vnp.vnp_size     :=size;
   obj^.un_pager.vnp.writemappings:=0;
 
   obj^.handle:=handle;
@@ -136,7 +128,7 @@ retry:
 end;
 
 { Create the VM system backing object for this vnode }
-function vnode_create_vobject(vp:p_vnode;isize:vm_ooffset_t):Integer;
+function vnode_create_vobject(vp:p_vnode;isize:vm_ooffset_t;budget_id:Integer):Integer;
 var
  obj:vm_object_t;
  size:QWORD;
@@ -182,6 +174,11 @@ begin
  end;
 
  obj:=vnode_pager_alloc(vp, size, 0, 0);
+
+ if (budget_id<>-1) then
+ begin
+  vm_object_set_budget(obj,budget_id);
+ end;
 
  {
   * Dereference the reference we just created.  This assumes

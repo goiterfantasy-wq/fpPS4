@@ -14,6 +14,7 @@ type
   UseVertexInput          :Boolean; //True
   UseTexelBuffer          :Boolean;
   UseOutput16             :Boolean;
+  UseAtomicFloatMinMax    :Boolean;
   UseOnlyUserdataPushConst:Boolean;
   UseExtendedEXECMask     :Boolean;
   //
@@ -37,6 +38,9 @@ type
   Function  CanUseStorageBufferClass:Boolean;
   Function  IsSpv14:Boolean;
   procedure UpgradeVersion(NewVersion:PtrUint);
+  procedure UpgradeVersion13;
+  procedure UpgradeVersion14;
+  procedure UpgradeVersion15;
  end;
 
 implementation
@@ -53,8 +57,17 @@ begin
 end;
 
 Function TsrConfig.CanUseStorageBufferClass:Boolean;
+const
+ target_vulkan13=False;
 begin
- Result:=(SpvVersion>=$10300);
+ if target_vulkan13 then
+ begin
+  UpgradeVersion13;
+  Result:=True;
+ end else
+ begin
+  Result:=(SpvVersion>=$10300);
+ end;
 end;
 
 Function TsrConfig.IsSpv14:Boolean;
@@ -69,6 +82,22 @@ begin
   SpvVersion:=NewVersion;
  end;
 end;
+
+procedure TsrConfig.UpgradeVersion13;
+begin
+ UpgradeVersion($10300);
+end;
+
+procedure TsrConfig.UpgradeVersion14;
+begin
+ UpgradeVersion($10400);
+end;
+
+procedure TsrConfig.UpgradeVersion15;
+begin
+ UpgradeVersion($10500);
+end;
+
 
 end.
 

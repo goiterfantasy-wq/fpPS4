@@ -135,30 +135,35 @@ const
 type
  p_teb=^teb;
  teb=packed record
-  SEH              :Pointer;
-  stack            :Pointer;
-  sttop            :Pointer;
-  SubSystemTib     :Pointer;
-  FiberData        :Pointer;
-  Arbitrary        :Pointer;
-  TIB              :Pointer;
-  _align1          :array[0..24] of QWORD;
-  WOW64            :Pointer;                 //0x100
-  _align2          :array[0..18] of QWORD;
-  _resrv1          :array[0..3] of QWORD;
-  thread           :Pointer;                 //0x1C0
-  fsbase           :Pointer;                 //0x1C8
-  gsbase           :Pointer;                 //0x1D0
-  jitcall          :Pointer;                 //0x1D8
-  jit_trp          :Pointer;                 //0x1E0
-  jit____          :Pointer;                 //0x1E8
-  iflag            :QWORD;                   //0x1F0
-  _resrv2          :array[0..17] of QWORD;
-  _align3          :array[0..7] of QWORD;
-  actctx           :Pointer;                 //0x2C8
-  _align4          :array[0..180] of QWORD;
-  _align5          :array[0..383] of QWORD;
-  DeallocationStack:Pointer;                 //0x1478
+  SEH               :Pointer;
+  stack             :Pointer;
+  sttop             :Pointer;
+  SubSystemTib      :Pointer;
+  FiberData         :Pointer;
+  Arbitrary         :Pointer;
+  TIB               :Pointer;
+  EnvironmentPointer:Pointer;
+  ClientId          :array[0..1] of QWORD;
+  ActiveRpcHandle   :QWORD;
+  ThreadLocalStorage:Pointer;
+  PEB               :Pointer;
+  _align1           :array[0..18] of QWORD;
+  WOW64             :Pointer;                 //0x100
+  _align2           :array[0..18] of QWORD;
+  _resrv1           :array[0..3] of QWORD;
+  thread            :Pointer;                 //0x1C0
+  fsbase            :Pointer;                 //0x1C8
+  gsbase            :Pointer;                 //0x1D0
+  jitcall           :Pointer;                 //0x1D8
+  jit_trp           :Pointer;                 //0x1E0
+  ipi_rip           :Pointer;                 //0x1E8
+  iflag             :QWORD;                   //0x1F0
+  _resrv2           :array[0..17] of QWORD;
+  _align3           :array[0..7] of QWORD;
+  actctx            :Pointer;                 //0x2C8
+  _align4           :array[0..180] of QWORD;
+  _align5           :array[0..383] of QWORD;
+  DeallocationStack :Pointer;                 //0x1478
  end;
 
 const
@@ -191,6 +196,13 @@ type
   size:QWORD;
  end;
 
+ t_lacuna=packed record
+  addr:Pointer;
+  chnk:Pointer;
+  size:QWORD;
+  orig:QWORD;
+ end;
+
  p_td_jctx=^t_td_jctx;
  t_td_jctx=packed record
   //block:Pointer;
@@ -198,6 +210,7 @@ type
   rbp:Pointer;
   local_cache:array[0..255] of Pointer;
   call_ret_cache:Pointer;
+  lacuna:t_lacuna;
  end;
 
  pp_kthread=^p_kthread;
@@ -267,6 +280,8 @@ type
   td_rmap_def_user:Pointer;
   td_sel          :Pointer;
   td_vp_reserv    :Int64;
+  pcb_curcpu      :Integer;
+  pcb_cpuref      :Integer;
   pcb_fsbase      :Pointer;
   pcb_gsbase      :Pointer;
   pcb_onfault     :Pointer;
@@ -305,19 +320,9 @@ function  curkthread:p_kthread;
 procedure set_curkthread(td:p_kthread);
 
 const
- SIG_ALTERABLE=$80000000;
- SIG_STI_LOCK =$40000000;
-
  NOT_PCB_FULL_IRET=not PCB_FULL_IRET;
- NOT_SIG_ALTERABLE=not SIG_ALTERABLE;
- NOT_SIG_STI_LOCK =not SIG_STI_LOCK;
 
  TDF_AST=TDF_ASTPENDING or TDF_NEEDRESCHED;
-
-procedure sig_sta; assembler;
-procedure sig_cla; assembler;
-procedure sig_sti; assembler;
-procedure sig_cli; assembler;
 
 procedure set_pcb_flags(td:p_kthread;f:Integer);
 
@@ -394,26 +399,6 @@ end;
 procedure set_curkthread(td:p_kthread); assembler; nostackframe;
 asm
  movqq td,%gs:teb.thread
-end;
-
-procedure sig_sta; assembler; nostackframe;
-asm
- lock orl SIG_ALTERABLE,%gs:teb.iflag
-end;
-
-procedure sig_cla; assembler; nostackframe;
-asm
- lock andl NOT_SIG_ALTERABLE,%gs:teb.iflag
-end;
-
-procedure sig_sti; assembler; nostackframe;
-asm
- lock orl SIG_STI_LOCK,%gs:teb.iflag
-end;
-
-procedure sig_cli; assembler; nostackframe;
-asm
- lock andl NOT_SIG_STI_LOCK,%gs:teb.iflag
 end;
 
 procedure set_pcb_flags(td:p_kthread;f:Integer);

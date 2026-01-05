@@ -10,6 +10,7 @@ uses
   spirv,
   srType,
   srReg,
+  srConst,
   emit_fetch;
 
 type
@@ -17,8 +18,8 @@ type
   procedure emit_VOP3c;
   procedure emit_VOP3b;
   procedure emit_VOP3a;
-  procedure emit_V_CMP_32(OpId:DWORD;rtype:TsrDataType;x:Boolean);
-  procedure emit_V_CMP_C (r,x:Boolean);
+  procedure emit_V_CMP  (OpId:DWORD;rtype:TsrDataType;x:Boolean);
+  procedure emit_V_CMP_C(r,x:Boolean);
   procedure emit_V_CMP_CLASS_32(x:Boolean);
 
   procedure emit_src_neg_bit(src:PPsrRegNode;count:Byte;rtype:TsrDataType);
@@ -36,12 +37,18 @@ type
   procedure emit_V_CNDMASK_B32;
   procedure emit_V_MUL_LEGACY_F32;
   procedure emit_V2_F32(OpId:DWORD;rev:Boolean);
+
+  procedure emit_V_CVT_PKNORM_I16_F32;
+  procedure emit_V_CVT_PKNORM_U16_F32;
   procedure emit_V_CVT_PKRTZ_F16_F32;
+
   procedure emit_V_MMX(OpId:DWORD;rtype:TsrDataType);
   procedure emit_V_MMX3(OpId:DWORD;rtype:TsrDataType);
   procedure emit_V_SH(OpId:DWORD;rtype:TsrDataType;rev:Boolean);
   procedure emit_V_MUL_LO(rtype:TsrDataType);
+  function  fetch_i24(src:TsrRegNode):TsrRegNode;
   procedure emit_V_MUL_I32_I24;
+  function  fetch_u24(src:TsrRegNode):TsrRegNode;
   procedure emit_V_MUL_U32_U24;
   procedure emit_V_MUL_HI(rtype:TsrDataType);
   procedure emit_V_MAC_F32;
@@ -69,6 +76,8 @@ type
   procedure emit_V_CUBE(OpId:Word);
   procedure emit_V_MOV_B32;
   procedure emit_V_CVT(OpId:DWORD;dst_type,src_type:TsrDataType);
+  procedure emit_V_CVT_F16_F32;
+  procedure emit_V_CVT_F32_F16;
   procedure emit_V_EXT_F32(OpId:DWORD);
   procedure emit_V_SIN_COS(OpId:DWORD);
   procedure emit_V_RCP_F32;
@@ -76,7 +85,7 @@ type
 
 implementation
 
-procedure TEmit_VOP3.emit_V_CMP_32(OpId:DWORD;rtype:TsrDataType;x:Boolean);
+procedure TEmit_VOP3.emit_V_CMP(OpId:DWORD;rtype:TsrDataType;x:Boolean);
 Var
  dst:array[0..1] of PsrRegSlot;
  src:array[0..1] of TsrRegNode;
@@ -86,8 +95,15 @@ begin
  Assert(FSPI.VOP3a.OMOD =0,'FSPI.VOP3a.OMOD');
  Assert(FSPI.VOP3a.CLAMP=0,'FSPI.VOP3a.CLAMP');
 
- src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC0,rtype);
- src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,rtype);
+ if (rtype.BitSize=64) then
+ begin
+  src[0]:=fetch_ssrc9_64(FSPI.VOP3a.SRC0,rtype);
+  src[1]:=fetch_ssrc9_64(FSPI.VOP3a.SRC1,rtype);
+ end else
+ begin
+  src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC0,rtype);
+  src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,rtype);
+ end;
 
  emit_src_abs_bit(@src,2,rtype);
  emit_src_neg_bit(@src,2,rtype);
@@ -325,6 +341,50 @@ begin
  emit_dst_clamp_f(dst,dtFloat32);
 end;
 
+procedure TEmit_VOP3.emit_V_CVT_PKNORM_I16_F32;
+Var
+ dst:PsrRegSlot;
+ src:array[0..1] of TsrRegNode;
+ vec:TsrRegNode;
+begin
+ dst:=get_vdst8(FSPI.VOP3a.VDST);
+
+ Assert(FSPI.VOP3a.OMOD =0,'FSPI.VOP3a.OMOD');
+ Assert(FSPI.VOP3a.CLAMP=0,'FSPI.VOP3a.CLAMP');
+
+ src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC0,dtFloat32);
+ src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,dtFloat32);
+
+ emit_src_abs_bit(@src,2,dtFloat32);
+ emit_src_neg_bit(@src,2,dtFloat32);
+
+ vec:=OpMakeVec(line,dtVec2f,@src);
+
+ OpGlsl1(GlslOp.packSnorm2x16,dtInt32,dst,vec);
+end;
+
+procedure TEmit_VOP3.emit_V_CVT_PKNORM_U16_F32;
+Var
+ dst:PsrRegSlot;
+ src:array[0..1] of TsrRegNode;
+ vec:TsrRegNode;
+begin
+ dst:=get_vdst8(FSPI.VOP3a.VDST);
+
+ Assert(FSPI.VOP3a.OMOD =0,'FSPI.VOP3a.OMOD');
+ Assert(FSPI.VOP3a.CLAMP=0,'FSPI.VOP3a.CLAMP');
+
+ src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC0,dtFloat32);
+ src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,dtFloat32);
+
+ emit_src_abs_bit(@src,2,dtFloat32);
+ emit_src_neg_bit(@src,2,dtFloat32);
+
+ vec:=OpMakeVec(line,dtVec2f,@src);
+
+ OpGlsl1(GlslOp.PackUnorm2x16,dtUint32,dst,vec);
+end;
+
 procedure TEmit_VOP3.emit_V_CVT_PKRTZ_F16_F32;
 Var
  dst:PsrRegSlot;
@@ -437,6 +497,28 @@ begin
  OpIMul(dst,src[0],src[1]);
 end;
 
+function int24(b:Integer):Integer; inline;
+const
+ shift=BitSizeOf(Integer)-24;
+begin
+ Result:=SarLongint((b shl shift),shift);
+end;
+
+function TEmit_VOP3.fetch_i24(src:TsrRegNode):TsrRegNode;
+var
+ pImm:TsrConst;
+begin
+ //early optimization
+ pImm:=src.pWriter.specialize AsType<ntConst>;
+ if (pImm<>nil) then
+ begin
+  Result:=NewImm_i(dtInt32,int24(pImm.AsInt32));
+ end else
+ begin
+  Result:=OpBFSETo(src,NewImm_i(dtInt32,0),NewImm_i(dtInt32,24));
+ end;
+end;
+
 procedure TEmit_VOP3.emit_V_MUL_I32_I24; //vdst = (vsrc0[23:0].s * vsrc1[23:0].s)
 Var
  dst:PsrRegSlot;
@@ -452,17 +534,32 @@ begin
  src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC0,dtInt32);
  src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,dtInt32);
 
- src[0]:=OpBFSETo(src[0],NewImm_i(dtInt32,0),NewImm_i(dtInt32,24));
- src[1]:=OpBFSETo(src[1],NewImm_i(dtInt32,0),NewImm_i(dtInt32,24));
+ src[0]:=fetch_i24(src[0]);
+ src[1]:=fetch_i24(src[1]);
 
  OpIMul(dst,src[0],src[1]);
+end;
+
+function TEmit_VOP3.fetch_u24(src:TsrRegNode):TsrRegNode;
+var
+ pImm:TsrConst;
+begin
+ //early optimization
+ pImm:=src.pWriter.specialize AsType<ntConst>;
+ if (pImm<>nil) then
+ begin
+  Result:=NewImm_i(dtUInt32,(pImm.AsInt32 and $FFFFFF));
+ end else
+ begin
+  Result:=OpAndTo(src,NewImm_q(dtUInt32,$FFFFFF));
+  Result.PrepType(ord(dtUInt32));
+ end;
 end;
 
 procedure TEmit_VOP3.emit_V_MUL_U32_U24;
 Var
  dst:PsrRegSlot;
  src:array[0..1] of TsrRegNode;
- bit24:TsrRegNode;
 begin
  dst:=get_vdst8(FSPI.VOP3a.VDST);
 
@@ -474,13 +571,8 @@ begin
  src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC0,dtUInt32);
  src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,dtUInt32);
 
- bit24:=NewImm_q(dtUInt32,$FFFFFF);
-
- src[0]:=OpAndTo(src[0],bit24);
- src[0].PrepType(ord(dtUInt32));
-
- src[1]:=OpAndTo(src[1],bit24);
- src[1].PrepType(ord(dtUInt32));
+ src[0]:=fetch_u24(src[0]);
+ src[1]:=fetch_u24(src[1]);
 
  OpIMul(dst,src[0],src[1]);
 end;
@@ -679,10 +771,11 @@ Var
 begin
  dst:=get_vdst8(FSPI.VOP3a.VDST);
 
- Assert(FSPI.VOP3a.OMOD =0,'FSPI.VOP3a.OMOD');
- Assert(FSPI.VOP3a.ABS  =0,'FSPI.VOP3a.ABS');
- Assert(FSPI.VOP3a.CLAMP=0,'FSPI.VOP3a.CLAMP');
- Assert(FSPI.VOP3a.NEG  =0,'FSPI.VOP3a.NEG');
+ //ignore
+ //Assert(FSPI.VOP3a.OMOD =0,'FSPI.VOP3a.OMOD');
+ //Assert(FSPI.VOP3a.ABS  =0,'FSPI.VOP3a.ABS');
+ //Assert(FSPI.VOP3a.CLAMP=0,'FSPI.VOP3a.CLAMP');
+ //Assert(FSPI.VOP3a.NEG  =0,'FSPI.VOP3a.NEG');
 
  bitmsk:=fetch_ssrc9(FSPI.VOP3a.SRC0,dtUint32);
  src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC1,dtUint32);
@@ -780,6 +873,7 @@ procedure TEmit_VOP3.emit_V_MAD_I32_I24; //vdst.i = vsrc0[23:0].i * vsrc1[23:0].
 Var
  dst:PsrRegSlot;
  src:array[0..2] of TsrRegNode;
+ pImm:TsrConst;
 begin
  dst:=get_vdst8(FSPI.VOP3a.VDST);
 
@@ -792,8 +886,8 @@ begin
  src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,dtInt32);
  src[2]:=fetch_ssrc9(FSPI.VOP3a.SRC2,dtInt32);
 
- src[0]:=OpBFSETo(src[0],NewImm_i(dtInt32,0),NewImm_i(dtInt32,24));
- src[1]:=OpBFSETo(src[1],NewImm_i(dtInt32,0),NewImm_i(dtInt32,24));
+ src[0]:=fetch_i24(src[0]);
+ src[1]:=fetch_i24(src[1]);
 
  OpFmaI32(dst,src[0],src[1],src[2]);
 end;
@@ -802,7 +896,6 @@ procedure TEmit_VOP3.emit_V_MAD_U32_U24; //vdst.u = vsrc0[23:0].u * vsrc1[23:0].
 Var
  dst:PsrRegSlot;
  src:array[0..2] of TsrRegNode;
- bit24:TsrRegNode;
 begin
  dst:=get_vdst8(FSPI.VOP3a.VDST);
 
@@ -815,13 +908,8 @@ begin
  src[1]:=fetch_ssrc9(FSPI.VOP3a.SRC1,dtUInt32);
  src[2]:=fetch_ssrc9(FSPI.VOP3a.SRC2,dtUInt32);
 
- bit24:=NewImm_q(dtUInt32,$FFFFFF);
-
- src[0]:=OpAndTo(src[0],bit24);
- src[0].PrepType(ord(dtUInt32));
-
- src[1]:=OpAndTo(src[1],bit24);
- src[1].PrepType(ord(dtUInt32));
+ src[0]:=fetch_u24(src[0]);
+ src[1]:=fetch_u24(src[1]);
 
  OpFmaU32(dst,src[0],src[1],src[2]);
 end;
@@ -1204,6 +1292,59 @@ begin
  emit_dst_clamp_f(dst,dst_type);
 end;
 
+procedure TEmit_VOP3.emit_V_CVT_F16_F32; //vdst[15:0].hf = ConvertFloatToHalfFloat(vsrc.f)
+Var
+ dst:PsrRegSlot;
+ src:array[0..1] of TsrRegNode;
+ dstv:TsrRegNode;
+begin
+ dst:=get_vdst8(FSPI.VOP3a.VDST);
+ src[0]:=fetch_ssrc9(FSPI.VOP3a.SRC0,dtFloat32);
+
+ emit_src_abs_bit(@src[0],1,dtFloat32);
+ emit_src_neg_bit(@src[0],1,dtFloat32);
+
+ MakeCopy(dst,src[0]);
+
+ emit_dst_omod__f(dst,dtFloat32);
+ emit_dst_clamp_f(dst,dtFloat32);
+
+ src[0]:=MakeRead(dst,dtFloat32);
+
+ src[0]:=OpFToF(src[0],dtHalf16);
+ src[1]:=NewImm_s(dtHalf16,0);
+
+ dstv:=OpMakeVec(line,dtVec2h,@src);
+
+ dst^.New(dtVec2h).pWriter:=dstv;
+end;
+
+procedure TEmit_VOP3.emit_V_CVT_F32_F16; //vdst.f = ConvertHalfFloatToFloat(vsrc[15:0].hf)
+Var
+ dst:PsrRegSlot;
+ src:TsrRegNode;
+ dst0:TsrRegNode;
+begin
+ dst:=get_vdst8(FSPI.VOP3a.VDST);
+ src:=fetch_ssrc9(FSPI.VOP3a.SRC0,dtVec2h{dtUnknow});
+
+ //src:=OpBitwiseAndTo(src,$FFFF);
+ //src^.PrepType(ord(dtHalf16));
+
+ dst0:=NewReg(dtHalf16);
+ OpExtract(line,dst0,src,0);
+
+ src:=OpFToF({src}dst0,dtFloat32);
+
+ emit_src_abs_bit(@src,1,dtFloat32);
+ emit_src_neg_bit(@src,1,dtFloat32);
+
+ MakeCopy(dst,src);
+
+ emit_dst_omod__f(dst,dtFloat32);
+ emit_dst_clamp_f(dst,dtFloat32);
+end;
+
 procedure TEmit_VOP3.emit_V_EXT_F32(OpId:DWORD);
 Var
  dst:PsrRegSlot;
@@ -1304,100 +1445,198 @@ begin
 
   //
 
-  V_CMP_LT_F32    :emit_V_CMP_32(Op.OpFOrdLessThan          ,dtFloat32,false);
-  V_CMP_EQ_F32    :emit_V_CMP_32(Op.OpFOrdEqual             ,dtFloat32,false);
-  V_CMP_LE_F32    :emit_V_CMP_32(Op.OpFOrdLessThanEqual     ,dtFloat32,false);
-  V_CMP_GT_F32    :emit_V_CMP_32(Op.OpFOrdGreaterThan       ,dtFloat32,false);
-  V_CMP_LG_F32    :emit_V_CMP_32(Op.OpFOrdNotEqual          ,dtFloat32,false);
-  V_CMP_GE_F32    :emit_V_CMP_32(Op.OpFOrdGreaterThanEqual  ,dtFloat32,false);
-  V_CMP_O_F32     :emit_V_CMP_32(Op.OpOrdered               ,dtFloat32,false);
-  V_CMP_U_F32     :emit_V_CMP_32(Op.OpUnordered             ,dtFloat32,false);
-  V_CMP_NGE_F32   :emit_V_CMP_32(Op.OpFUnordLessThan        ,dtFloat32,false);
-  V_CMP_NLG_F32   :emit_V_CMP_32(Op.OpFUnordEqual           ,dtFloat32,false);
-  V_CMP_NGT_F32   :emit_V_CMP_32(Op.OpFUnordLessThanEqual   ,dtFloat32,false);
-  V_CMP_NLE_F32   :emit_V_CMP_32(Op.OpFUnordGreaterThan     ,dtFloat32,false);
-  V_CMP_NEQ_F32   :emit_V_CMP_32(Op.OpFUnordNotEqual        ,dtFloat32,false);
-  V_CMP_NLT_F32   :emit_V_CMP_32(Op.OpFUnordGreaterThanEqual,dtFloat32,false);
+  V_CMP_LT_F32    :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat32,false);
+  V_CMP_EQ_F32    :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat32,false);
+  V_CMP_LE_F32    :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat32,false);
+  V_CMP_GT_F32    :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat32,false);
+  V_CMP_LG_F32    :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat32,false);
+  V_CMP_GE_F32    :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat32,false);
+  V_CMP_O_F32     :emit_V_CMP(Op.OpOrdered               ,dtFloat32,false);
+  V_CMP_U_F32     :emit_V_CMP(Op.OpUnordered             ,dtFloat32,false);
+  V_CMP_NGE_F32   :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat32,false);
+  V_CMP_NLG_F32   :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat32,false);
+  V_CMP_NGT_F32   :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat32,false);
+  V_CMP_NLE_F32   :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat32,false);
+  V_CMP_NEQ_F32   :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat32,false);
+  V_CMP_NLT_F32   :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat32,false);
 
-  V_CMPX_LT_F32   :emit_V_CMP_32(Op.OpFOrdLessThan          ,dtFloat32,true);
-  V_CMPX_EQ_F32   :emit_V_CMP_32(Op.OpFOrdEqual             ,dtFloat32,true);
-  V_CMPX_LE_F32   :emit_V_CMP_32(Op.OpFOrdLessThanEqual     ,dtFloat32,true);
-  V_CMPX_GT_F32   :emit_V_CMP_32(Op.OpFOrdGreaterThan       ,dtFloat32,true);
-  V_CMPX_LG_F32   :emit_V_CMP_32(Op.OpFOrdNotEqual          ,dtFloat32,true);
-  V_CMPX_GE_F32   :emit_V_CMP_32(Op.OpFOrdGreaterThanEqual  ,dtFloat32,true);
-  V_CMPX_O_F32    :emit_V_CMP_32(Op.OpOrdered               ,dtFloat32,true);
-  V_CMPX_U_F32    :emit_V_CMP_32(Op.OpUnordered             ,dtFloat32,true);
-  V_CMPX_NGE_F32  :emit_V_CMP_32(Op.OpFUnordLessThan        ,dtFloat32,true);
-  V_CMPX_NLG_F32  :emit_V_CMP_32(Op.OpFUnordEqual           ,dtFloat32,true);
-  V_CMPX_NGT_F32  :emit_V_CMP_32(Op.OpFUnordLessThanEqual   ,dtFloat32,true);
-  V_CMPX_NLE_F32  :emit_V_CMP_32(Op.OpFUnordGreaterThan     ,dtFloat32,true);
-  V_CMPX_NEQ_F32  :emit_V_CMP_32(Op.OpFUnordNotEqual        ,dtFloat32,true);
-  V_CMPX_NLT_F32  :emit_V_CMP_32(Op.OpFUnordGreaterThanEqual,dtFloat32,true);
-
-  //
-
-  V_CMPS_LT_F32   :emit_V_CMP_32(Op.OpFOrdLessThan          ,dtFloat32,false);
-  V_CMPS_EQ_F32   :emit_V_CMP_32(Op.OpFOrdEqual             ,dtFloat32,false);
-  V_CMPS_LE_F32   :emit_V_CMP_32(Op.OpFOrdLessThanEqual     ,dtFloat32,false);
-  V_CMPS_GT_F32   :emit_V_CMP_32(Op.OpFOrdGreaterThan       ,dtFloat32,false);
-  V_CMPS_LG_F32   :emit_V_CMP_32(Op.OpFOrdNotEqual          ,dtFloat32,false);
-  V_CMPS_GE_F32   :emit_V_CMP_32(Op.OpFOrdGreaterThanEqual  ,dtFloat32,false);
-  V_CMPS_O_F32    :emit_V_CMP_32(Op.OpOrdered               ,dtFloat32,false);
-  V_CMPS_U_F32    :emit_V_CMP_32(Op.OpUnordered             ,dtFloat32,false);
-  V_CMPS_NGE_F32  :emit_V_CMP_32(Op.OpFUnordLessThan        ,dtFloat32,false);
-  V_CMPS_NLG_F32  :emit_V_CMP_32(Op.OpFUnordEqual           ,dtFloat32,false);
-  V_CMPS_NGT_F32  :emit_V_CMP_32(Op.OpFUnordLessThanEqual   ,dtFloat32,false);
-  V_CMPS_NLE_F32  :emit_V_CMP_32(Op.OpFUnordGreaterThan     ,dtFloat32,false);
-  V_CMPS_NEQ_F32  :emit_V_CMP_32(Op.OpFUnordNotEqual        ,dtFloat32,false);
-  V_CMPS_NLT_F32  :emit_V_CMP_32(Op.OpFUnordGreaterThanEqual,dtFloat32,false);
-
-  V_CMPSX_LT_F32  :emit_V_CMP_32(Op.OpFOrdLessThan          ,dtFloat32,true);
-  V_CMPSX_EQ_F32  :emit_V_CMP_32(Op.OpFOrdEqual             ,dtFloat32,true);
-  V_CMPSX_LE_F32  :emit_V_CMP_32(Op.OpFOrdLessThanEqual     ,dtFloat32,true);
-  V_CMPSX_GT_F32  :emit_V_CMP_32(Op.OpFOrdGreaterThan       ,dtFloat32,true);
-  V_CMPSX_LG_F32  :emit_V_CMP_32(Op.OpFOrdNotEqual          ,dtFloat32,true);
-  V_CMPSX_GE_F32  :emit_V_CMP_32(Op.OpFOrdGreaterThanEqual  ,dtFloat32,true);
-  V_CMPSX_O_F32   :emit_V_CMP_32(Op.OpOrdered               ,dtFloat32,true);
-  V_CMPSX_U_F32   :emit_V_CMP_32(Op.OpUnordered             ,dtFloat32,true);
-  V_CMPSX_NGE_F32 :emit_V_CMP_32(Op.OpFUnordLessThan        ,dtFloat32,true);
-  V_CMPSX_NLG_F32 :emit_V_CMP_32(Op.OpFUnordEqual           ,dtFloat32,true);
-  V_CMPSX_NGT_F32 :emit_V_CMP_32(Op.OpFUnordLessThanEqual   ,dtFloat32,true);
-  V_CMPSX_NLE_F32 :emit_V_CMP_32(Op.OpFUnordGreaterThan     ,dtFloat32,true);
-  V_CMPSX_NEQ_F32 :emit_V_CMP_32(Op.OpFUnordNotEqual        ,dtFloat32,true);
-  V_CMPSX_NLT_F32 :emit_V_CMP_32(Op.OpFUnordGreaterThanEqual,dtFloat32,true);
+  V_CMPX_LT_F32   :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat32,true);
+  V_CMPX_EQ_F32   :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat32,true);
+  V_CMPX_LE_F32   :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat32,true);
+  V_CMPX_GT_F32   :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat32,true);
+  V_CMPX_LG_F32   :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat32,true);
+  V_CMPX_GE_F32   :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat32,true);
+  V_CMPX_O_F32    :emit_V_CMP(Op.OpOrdered               ,dtFloat32,true);
+  V_CMPX_U_F32    :emit_V_CMP(Op.OpUnordered             ,dtFloat32,true);
+  V_CMPX_NGE_F32  :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat32,true);
+  V_CMPX_NLG_F32  :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat32,true);
+  V_CMPX_NGT_F32  :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat32,true);
+  V_CMPX_NLE_F32  :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat32,true);
+  V_CMPX_NEQ_F32  :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat32,true);
+  V_CMPX_NLT_F32  :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat32,true);
 
   //
 
-  V_CMP_LT_I32    :emit_V_CMP_32(Op.OpSLessThan             ,dtInt32,false);
-  V_CMP_EQ_I32    :emit_V_CMP_32(Op.OpIEqual                ,dtInt32,false);
-  V_CMP_LE_I32    :emit_V_CMP_32(Op.OpSLessThanEqual        ,dtInt32,false);
-  V_CMP_GT_I32    :emit_V_CMP_32(Op.OpSGreaterThan          ,dtInt32,false);
-  V_CMP_LG_I32    :emit_V_CMP_32(Op.OpINotEqual             ,dtInt32,false);
-  V_CMP_GE_I32    :emit_V_CMP_32(Op.OpSGreaterThanEqual     ,dtInt32,false);
+  V_CMPS_LT_F32   :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat32,false);
+  V_CMPS_EQ_F32   :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat32,false);
+  V_CMPS_LE_F32   :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat32,false);
+  V_CMPS_GT_F32   :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat32,false);
+  V_CMPS_LG_F32   :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat32,false);
+  V_CMPS_GE_F32   :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat32,false);
+  V_CMPS_O_F32    :emit_V_CMP(Op.OpOrdered               ,dtFloat32,false);
+  V_CMPS_U_F32    :emit_V_CMP(Op.OpUnordered             ,dtFloat32,false);
+  V_CMPS_NGE_F32  :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat32,false);
+  V_CMPS_NLG_F32  :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat32,false);
+  V_CMPS_NGT_F32  :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat32,false);
+  V_CMPS_NLE_F32  :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat32,false);
+  V_CMPS_NEQ_F32  :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat32,false);
+  V_CMPS_NLT_F32  :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat32,false);
 
-  V_CMPX_LT_I32   :emit_V_CMP_32(Op.OpSLessThan             ,dtInt32,true);
-  V_CMPX_EQ_I32   :emit_V_CMP_32(Op.OpIEqual                ,dtInt32,true);
-  V_CMPX_LE_I32   :emit_V_CMP_32(Op.OpSLessThanEqual        ,dtInt32,true);
-  V_CMPX_GT_I32   :emit_V_CMP_32(Op.OpSGreaterThan          ,dtInt32,true);
-  V_CMPX_LG_I32   :emit_V_CMP_32(Op.OpINotEqual             ,dtInt32,true);
-  V_CMPX_GE_I32   :emit_V_CMP_32(Op.OpSGreaterThanEqual     ,dtInt32,true);
+  V_CMPSX_LT_F32  :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat32,true);
+  V_CMPSX_EQ_F32  :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat32,true);
+  V_CMPSX_LE_F32  :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat32,true);
+  V_CMPSX_GT_F32  :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat32,true);
+  V_CMPSX_LG_F32  :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat32,true);
+  V_CMPSX_GE_F32  :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat32,true);
+  V_CMPSX_O_F32   :emit_V_CMP(Op.OpOrdered               ,dtFloat32,true);
+  V_CMPSX_U_F32   :emit_V_CMP(Op.OpUnordered             ,dtFloat32,true);
+  V_CMPSX_NGE_F32 :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat32,true);
+  V_CMPSX_NLG_F32 :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat32,true);
+  V_CMPSX_NGT_F32 :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat32,true);
+  V_CMPSX_NLE_F32 :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat32,true);
+  V_CMPSX_NEQ_F32 :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat32,true);
+  V_CMPSX_NLT_F32 :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat32,true);
 
-  V_CMP_LT_U32    :emit_V_CMP_32(Op.OpULessThan             ,dtUint32,false);
-  V_CMP_EQ_U32    :emit_V_CMP_32(Op.OpIEqual                ,dtUint32,false);
-  V_CMP_LE_U32    :emit_V_CMP_32(Op.OpULessThanEqual        ,dtUint32,false);
-  V_CMP_GT_U32    :emit_V_CMP_32(Op.OpUGreaterThan          ,dtUint32,false);
-  V_CMP_LG_U32    :emit_V_CMP_32(Op.OpINotEqual             ,dtUint32,false);
-  V_CMP_GE_U32    :emit_V_CMP_32(Op.OpUGreaterThanEqual     ,dtUint32,false);
+  //
 
-  V_CMPX_LT_U32   :emit_V_CMP_32(Op.OpULessThan             ,dtUint32,true);
-  V_CMPX_EQ_U32   :emit_V_CMP_32(Op.OpIEqual                ,dtUint32,true);
-  V_CMPX_LE_U32   :emit_V_CMP_32(Op.OpULessThanEqual        ,dtUint32,true);
-  V_CMPX_GT_U32   :emit_V_CMP_32(Op.OpUGreaterThan          ,dtUint32,true);
-  V_CMPX_LG_U32   :emit_V_CMP_32(Op.OpINotEqual             ,dtUint32,true);
-  V_CMPX_GE_U32   :emit_V_CMP_32(Op.OpUGreaterThanEqual     ,dtUint32,true);
+  V_CMP_LT_I32    :emit_V_CMP(Op.OpSLessThan             ,dtInt32,false);
+  V_CMP_EQ_I32    :emit_V_CMP(Op.OpIEqual                ,dtInt32,false);
+  V_CMP_LE_I32    :emit_V_CMP(Op.OpSLessThanEqual        ,dtInt32,false);
+  V_CMP_GT_I32    :emit_V_CMP(Op.OpSGreaterThan          ,dtInt32,false);
+  V_CMP_LG_I32    :emit_V_CMP(Op.OpINotEqual             ,dtInt32,false);
+  V_CMP_GE_I32    :emit_V_CMP(Op.OpSGreaterThanEqual     ,dtInt32,false);
+
+  V_CMPX_LT_I32   :emit_V_CMP(Op.OpSLessThan             ,dtInt32,true);
+  V_CMPX_EQ_I32   :emit_V_CMP(Op.OpIEqual                ,dtInt32,true);
+  V_CMPX_LE_I32   :emit_V_CMP(Op.OpSLessThanEqual        ,dtInt32,true);
+  V_CMPX_GT_I32   :emit_V_CMP(Op.OpSGreaterThan          ,dtInt32,true);
+  V_CMPX_LG_I32   :emit_V_CMP(Op.OpINotEqual             ,dtInt32,true);
+  V_CMPX_GE_I32   :emit_V_CMP(Op.OpSGreaterThanEqual     ,dtInt32,true);
+
+  V_CMP_LT_U32    :emit_V_CMP(Op.OpULessThan             ,dtUint32,false);
+  V_CMP_EQ_U32    :emit_V_CMP(Op.OpIEqual                ,dtUint32,false);
+  V_CMP_LE_U32    :emit_V_CMP(Op.OpULessThanEqual        ,dtUint32,false);
+  V_CMP_GT_U32    :emit_V_CMP(Op.OpUGreaterThan          ,dtUint32,false);
+  V_CMP_LG_U32    :emit_V_CMP(Op.OpINotEqual             ,dtUint32,false);
+  V_CMP_GE_U32    :emit_V_CMP(Op.OpUGreaterThanEqual     ,dtUint32,false);
+
+  V_CMPX_LT_U32   :emit_V_CMP(Op.OpULessThan             ,dtUint32,true);
+  V_CMPX_EQ_U32   :emit_V_CMP(Op.OpIEqual                ,dtUint32,true);
+  V_CMPX_LE_U32   :emit_V_CMP(Op.OpULessThanEqual        ,dtUint32,true);
+  V_CMPX_GT_U32   :emit_V_CMP(Op.OpUGreaterThan          ,dtUint32,true);
+  V_CMPX_LG_U32   :emit_V_CMP(Op.OpINotEqual             ,dtUint32,true);
+  V_CMPX_GE_U32   :emit_V_CMP(Op.OpUGreaterThanEqual     ,dtUint32,true);
+
+  //
+
+  V_CMP_LT_F64    :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat64,false);
+  V_CMP_EQ_F64    :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat64,false);
+  V_CMP_LE_F64    :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat64,false);
+  V_CMP_GT_F64    :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat64,false);
+  V_CMP_LG_F64    :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat64,false);
+  V_CMP_GE_F64    :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat64,false);
+  V_CMP_O_F64     :emit_V_CMP(Op.OpOrdered               ,dtFloat64,false);
+  V_CMP_U_F64     :emit_V_CMP(Op.OpUnordered             ,dtFloat64,false);
+  V_CMP_NGE_F64   :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat64,false);
+  V_CMP_NLG_F64   :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat64,false);
+  V_CMP_NGT_F64   :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat64,false);
+  V_CMP_NLE_F64   :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat64,false);
+  V_CMP_NEQ_F64   :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat64,false);
+  V_CMP_NLT_F64   :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat64,false);
+
+  V_CMPX_LT_F64   :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat64,true);
+  V_CMPX_EQ_F64   :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat64,true);
+  V_CMPX_LE_F64   :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat64,true);
+  V_CMPX_GT_F64   :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat64,true);
+  V_CMPX_LG_F64   :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat64,true);
+  V_CMPX_GE_F64   :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat64,true);
+  V_CMPX_O_F64    :emit_V_CMP(Op.OpOrdered               ,dtFloat64,true);
+  V_CMPX_U_F64    :emit_V_CMP(Op.OpUnordered             ,dtFloat64,true);
+  V_CMPX_NGE_F64  :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat64,true);
+  V_CMPX_NLG_F64  :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat64,true);
+  V_CMPX_NGT_F64  :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat64,true);
+  V_CMPX_NLE_F64  :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat64,true);
+  V_CMPX_NEQ_F64  :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat64,true);
+  V_CMPX_NLT_F64  :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat64,true);
+
+  //
+
+  V_CMPS_LT_F64   :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat64,false);
+  V_CMPS_EQ_F64   :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat64,false);
+  V_CMPS_LE_F64   :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat64,false);
+  V_CMPS_GT_F64   :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat64,false);
+  V_CMPS_LG_F64   :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat64,false);
+  V_CMPS_GE_F64   :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat64,false);
+  V_CMPS_O_F64    :emit_V_CMP(Op.OpOrdered               ,dtFloat64,false);
+  V_CMPS_U_F64    :emit_V_CMP(Op.OpUnordered             ,dtFloat64,false);
+  V_CMPS_NGE_F64  :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat64,false);
+  V_CMPS_NLG_F64  :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat64,false);
+  V_CMPS_NGT_F64  :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat64,false);
+  V_CMPS_NLE_F64  :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat64,false);
+  V_CMPS_NEQ_F64  :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat64,false);
+  V_CMPS_NLT_F64  :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat64,false);
+
+  V_CMPSX_LT_F64  :emit_V_CMP(Op.OpFOrdLessThan          ,dtFloat64,true);
+  V_CMPSX_EQ_F64  :emit_V_CMP(Op.OpFOrdEqual             ,dtFloat64,true);
+  V_CMPSX_LE_F64  :emit_V_CMP(Op.OpFOrdLessThanEqual     ,dtFloat64,true);
+  V_CMPSX_GT_F64  :emit_V_CMP(Op.OpFOrdGreaterThan       ,dtFloat64,true);
+  V_CMPSX_LG_F64  :emit_V_CMP(Op.OpFOrdNotEqual          ,dtFloat64,true);
+  V_CMPSX_GE_F64  :emit_V_CMP(Op.OpFOrdGreaterThanEqual  ,dtFloat64,true);
+  V_CMPSX_O_F64   :emit_V_CMP(Op.OpOrdered               ,dtFloat64,true);
+  V_CMPSX_U_F64   :emit_V_CMP(Op.OpUnordered             ,dtFloat64,true);
+  V_CMPSX_NGE_F64 :emit_V_CMP(Op.OpFUnordLessThan        ,dtFloat64,true);
+  V_CMPSX_NLG_F64 :emit_V_CMP(Op.OpFUnordEqual           ,dtFloat64,true);
+  V_CMPSX_NGT_F64 :emit_V_CMP(Op.OpFUnordLessThanEqual   ,dtFloat64,true);
+  V_CMPSX_NLE_F64 :emit_V_CMP(Op.OpFUnordGreaterThan     ,dtFloat64,true);
+  V_CMPSX_NEQ_F64 :emit_V_CMP(Op.OpFUnordNotEqual        ,dtFloat64,true);
+  V_CMPSX_NLT_F64 :emit_V_CMP(Op.OpFUnordGreaterThanEqual,dtFloat64,true);
+
+  //
+
+  V_CMP_LT_I64    :emit_V_CMP(Op.OpSLessThan             ,dtInt64,false);
+  V_CMP_EQ_I64    :emit_V_CMP(Op.OpIEqual                ,dtInt64,false);
+  V_CMP_LE_I64    :emit_V_CMP(Op.OpSLessThanEqual        ,dtInt64,false);
+  V_CMP_GT_I64    :emit_V_CMP(Op.OpSGreaterThan          ,dtInt64,false);
+  V_CMP_LG_I64    :emit_V_CMP(Op.OpINotEqual             ,dtInt64,false);
+  V_CMP_GE_I64    :emit_V_CMP(Op.OpSGreaterThanEqual     ,dtInt64,false);
+
+  V_CMPX_LT_I64   :emit_V_CMP(Op.OpSLessThan             ,dtInt64,true);
+  V_CMPX_EQ_I64   :emit_V_CMP(Op.OpIEqual                ,dtInt64,true);
+  V_CMPX_LE_I64   :emit_V_CMP(Op.OpSLessThanEqual        ,dtInt64,true);
+  V_CMPX_GT_I64   :emit_V_CMP(Op.OpSGreaterThan          ,dtInt64,true);
+  V_CMPX_LG_I64   :emit_V_CMP(Op.OpINotEqual             ,dtInt64,true);
+  V_CMPX_GE_I64   :emit_V_CMP(Op.OpSGreaterThanEqual     ,dtInt64,true);
+
+  V_CMP_LT_U64    :emit_V_CMP(Op.OpULessThan             ,dtUint64,false);
+  V_CMP_EQ_U64    :emit_V_CMP(Op.OpIEqual                ,dtUint64,false);
+  V_CMP_LE_U64    :emit_V_CMP(Op.OpULessThanEqual        ,dtUint64,false);
+  V_CMP_GT_U64    :emit_V_CMP(Op.OpUGreaterThan          ,dtUint64,false);
+  V_CMP_LG_U64    :emit_V_CMP(Op.OpINotEqual             ,dtUint64,false);
+  V_CMP_GE_U64    :emit_V_CMP(Op.OpUGreaterThanEqual     ,dtUint64,false);
+
+  V_CMPX_LT_U64   :emit_V_CMP(Op.OpULessThan             ,dtUint64,true);
+  V_CMPX_EQ_U64   :emit_V_CMP(Op.OpIEqual                ,dtUint64,true);
+  V_CMPX_LE_U64   :emit_V_CMP(Op.OpULessThanEqual        ,dtUint64,true);
+  V_CMPX_GT_U64   :emit_V_CMP(Op.OpUGreaterThan          ,dtUint64,true);
+  V_CMPX_LG_U64   :emit_V_CMP(Op.OpINotEqual             ,dtUint64,true);
+  V_CMPX_GE_U64   :emit_V_CMP(Op.OpUGreaterThanEqual     ,dtUint64,true);
+
+  //
 
   V_CMP_CLASS_F32 :emit_V_CMP_CLASS_32(false);
   V_CMPX_CLASS_F32:emit_V_CMP_CLASS_32(true );
+
+  //
 
   else
    Assert(false,'VOP3c?'+IntToStr(FSPI.VOP3a.OP)+' '+get_str_spi(FSPI));
@@ -1541,8 +1780,9 @@ begin
  dst:=get_vdst8(FSPI.VOP3b.VDST);
  bor:=get_sdst7(FSPI.VOP3b.SDST);
 
- Assert(FSPI.VOP3b.OMOD=0,'FSPI.VOP3b.OMOD');
- Assert(FSPI.VOP3b.NEG =0,'FSPI.VOP3b.NEG');
+ //ignored
+ //Assert(FSPI.VOP3b.OMOD=0,'FSPI.VOP3b.OMOD');
+ //Assert(FSPI.VOP3b.NEG =0,'FSPI.VOP3b.NEG');
 
  src[0]:=fetch_ssrc9(FSPI.VOP3b.SRC0,dtUInt32);
  src[1]:=fetch_ssrc9(FSPI.VOP3b.SRC1,dtUInt32);
@@ -1597,6 +1837,8 @@ begin
   256+V_ASHR_I32   : emit_V_SH(Op.OpShiftRightArithmetic,dtInt32 ,False);
   256+V_ASHRREV_I32: emit_V_SH(Op.OpShiftRightArithmetic,dtInt32 ,True );
 
+  256+V_CVT_PKNORM_I16_F32:emit_V_CVT_PKNORM_I16_F32;
+  256+V_CVT_PKNORM_U16_F32:emit_V_CVT_PKNORM_U16_F32;
   256+V_CVT_PKRTZ_F16_F32: emit_V_CVT_PKRTZ_F16_F32;
 
   256+V_MIN_LEGACY_F32:emit_V_MMX(GlslOp.NMin,dtFloat32);
@@ -1680,6 +1922,9 @@ begin
   384+V_CVT_F32_U32: emit_V_CVT(Op.OpConvertUToF,dtFloat32,dtUInt32);
   384+V_CVT_U32_F32: emit_V_CVT(Op.OpConvertFToU,dtUInt32 ,dtFloat32);
   384+V_CVT_I32_F32: emit_V_CVT(Op.OpConvertFToS,dtInt32  ,dtFloat32);
+
+  384+V_CVT_F16_F32: emit_V_CVT_F16_F32;
+  384+V_CVT_F32_F16: emit_V_CVT_F32_F16;
 
   384+V_MOV_B32  : emit_V_MOV_B32;
 

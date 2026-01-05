@@ -8,42 +8,21 @@ interface
 uses
  sysutils,
  sys_conf,
- sys_vm_object,
+ vm_object,
+ vm,
+ vm_blockpool,
  dmem_map,
  rmem_map;
 
 type
- pSceKernelDirectMemoryQueryInfo=^SceKernelDirectMemoryQueryInfo;
- SceKernelDirectMemoryQueryInfo=packed record
-  start:QWORD;
-  __end:QWORD;
-  mType:Integer;
-  align:Integer;
+ p_query_memory_prot=^t_query_memory_prot;
+ t_query_memory_prot=packed record
+  start:Pointer;
+  __end:Pointer;
+  prot  :Integer;
+  eflags:Integer;
  end;
-
-const
- SCE_KERNEL_VIRTUAL_RANGE_NAME_SIZE=32;
- SCE_KERNEL_DMQ_FIND_NEXT=1;
- SCE_KERNEL_VQ_FIND_NEXT =1;
-
-type
- pSceKernelVirtualQueryInfo=^SceKernelVirtualQueryInfo;
- SceKernelVirtualQueryInfo=packed record
-  pstart:Pointer;
-  p__end:Pointer;
-  offset:QWORD;
-  protection:Integer;
-  memoryType:Integer;
-  bits:bitpacked record
-   isFlexibleMemory:0..1; //1
-   isDirectMemory  :0..1; //2
-   isStack         :0..1; //4
-   isPooledMemory  :0..1; //8
-   isCommitted     :0..1; //16
-  end;
-  name:array[0..SCE_KERNEL_VIRTUAL_RANGE_NAME_SIZE-1] of AnsiChar;
-  align:array[0..6] of Byte;
- end;
+ {$IF sizeof(t_query_memory_prot)<>24}{$STOP sizeof(t_query_memory_prot)<>24}{$ENDIF}
 
 type
  p_dmem_obj=^t_dmem_obj;
@@ -75,7 +54,9 @@ function  sys_virtual_query(addr:Pointer;
                             info:Pointer;
                             infoSize:QWORD):Integer;
 
-function  rmem_map_test_lock(start,__end:QWORD;mode:Integer):Boolean;
+function  sys_query_memory_protection(addr:Pointer;info:Pointer):Integer;
+
+function  rmem_map_test_lock(start,__end:QWORD;mode:t_rmem_test_mode):Boolean;
 
 function  obj2dmem(obj:vm_object_t):p_dmem_map;
 
@@ -87,7 +68,6 @@ uses
  errno,
  md_systm,
  systm,
- vm,
  vmparam,
  vm_map,
  kern_authinfo,
@@ -144,7 +124,7 @@ begin
  td:=curkthread;
  if (td=nil) then Exit(-1);
 
- td^.td_retval[0]:=p_proc.p_pool_id;
+ td^.td_retval[0]:=p_proc.p_dmem_pool_id;
  Result:=0;
 
  if (d_pool_id<>-1) then
@@ -164,9 +144,9 @@ begin
  Result:=0;
 end;
 
-function sdk_version_big_20():Boolean; inline;
+function has_sdk_version_30():Boolean; inline;
 begin
- Result:=p_proc.p_sdk_version > $2ffffff;
+ Result:=p_proc.p_sdk_version >= $3000000;
 end;
 
 function vm_mmap_to_errno(rv:Integer):Integer; inline;
@@ -181,7 +161,7 @@ begin
  end;
 end;
 
-function rmem_map_test_lock(start,__end:QWORD;mode:Integer):Boolean;
+function rmem_map_test_lock(start,__end:QWORD;mode:t_rmem_test_mode):Boolean;
 begin
  rmem_map_lock(@rmap);
   Result:=rmem_map_test(@rmap,start,__end,mode);
@@ -209,7 +189,7 @@ var
 
  entry,next:vm_map_entry_t;
 
- cow:Integer;
+ cow:DWORD;
  err:Integer;
 
  found:Boolean;
@@ -222,14 +202,9 @@ begin
   Exit(EACCES);
  end;
 
- dmap:=dmem_maps[p_proc.p_pool_id];
+ dmap:=dmem_maps[p_proc.p_dmem_pool_id];
 
- //entry->eflags = flags & 0x400000 | 0x20000 | 0x80000
- //0x400000 -> MAP_ENTRY_NO_COALESCE -> MAP_NO_COALESCE
- //0x20000  -> MAP_ENTRY_IN_TRANSITION2
- //0x80000  -> ???
-
- cow:=(flags and MAP_NO_COALESCE);
+ cow:=(flags and MAP_NO_COALESCE) or MAP_COW_MMAP_DMEM;
 
  vm_map_lock(map);
 
@@ -243,10 +218,10 @@ begin
   if (v_end <=map^.max_offset) and
      ( ((flags and MAP_SANITIZER)<>0) or
        ((vaddr shr 47) <> 0) or
-       (v_end < QWORD($fc00000001)) or
-       (sdk_version_big_20()=false) ) then
+       (v_end <= MAP_AREA_END) or
+       (has_sdk_version_30()=false) ) then
   begin
-   found:=rmem_map_test_lock(phaddr,phaddr+length,0);
+   found:=rmem_map_test_lock(phaddr,phaddr+length,rt_intersection);
 
    //
    if (not found) or //not found
@@ -260,14 +235,18 @@ begin
                             OFF_TO_IDX(phaddr+length),
                             mtype,
                             prot,
-                            flags);
+                            (flags and MAP_WRITABLE_WB_GARLIC) or MAP_NO_COALESCE
+                           );
 
     if (err=0) then
     begin
 
+     //try to expand addres space
+     vm_map_expand(map, vaddr, v_end);
+
      if (align=0) and ((flags and MAP_NO_OVERWRITE)=0) then
      begin
-      vm_map_delete(map, vaddr, v_end, True);
+      vm_map_delete(map, vaddr, v_end);
      end;
 
      vm_object_reference(dmap.vobj);
@@ -278,9 +257,7 @@ begin
                         vaddr, v_end,
                         prot, VM_PROT_ALL,
                         cow,
-                        anon,
-                        ((p_proc.p_dmem_aliasing and 3)<>0),
-                        False
+                        anon
                        );
 
      if (err=0) then
@@ -292,6 +269,9 @@ begin
       //
       Result:=vm_mmap_to_errno(err);
      end;
+    end else
+    begin
+     Result:=err;
     end;
 
    end else
@@ -305,7 +285,7 @@ begin
    end else
    begin
     Writeln('[KERNEL] multiple VA mappings are detected. va:[0x',HexStr(vaddr,16),',0x',HexStr(v_end,16),')');
-    Result:=EINVAL;
+    Result:=EBUSY;
    end;
 
   end else
@@ -338,7 +318,7 @@ begin
      next:=entry^.next;
      if (next=@map^.header) then
      begin
-      if (length <= (map^.header.__end - vaddr)) then goto _fixed;
+      if (length <= (vm_map_max(map) - vaddr)) then goto _fixed;
       Break;
      end;
      if (length <= (next^.start - vaddr)) then goto _fixed;
@@ -383,7 +363,7 @@ begin
   Exit(Pointer(EPERM));
  end;
 
- if (p_proc.p_pool_id<>1) then
+ if (p_proc.p_dmem_pool_id<>1) then
  begin
   Exit(Pointer(EOPNOTSUPP));
  end;
@@ -401,6 +381,11 @@ begin
  end;
 
  if (((flags and $e09fff6f) or (prot and $ffffffcc))<>0) then
+ begin
+  Exit(Pointer(EINVAL));
+ end;
+
+ if (DWORD(mtype + 1) > 11) then
  begin
   Exit(Pointer(EINVAL));
  end;
@@ -460,16 +445,16 @@ begin
     addr:=SCE_USR_HEAP_START;
    end;
   end else
-  if ( (QWORD(stack_addr) - QWORD($7f0000000)) > QWORD($7ffffffff)) and
-     (addr < QWORD($ff0000001)) and
-     ( (length + addr) > QWORD($7efffffff)) then
+  if ( (QWORD(stack_addr) - QWORD($7f0000000)) >= QWORD($800000000)) and
+     (addr <= QWORD($ff0000000)) and
+     ( (length + addr) >= QWORD($7f0000000)) then
   begin
-   addr:=$ff0000000;
+   addr:=$ff0000000; //SCE_KERNEl_GNM_TESS_AREA
   end;
 
   align:=(flags shr MAP_ALIGNMENT_SHIFT) and $1f;
   if (align<PAGE_SHIFT) then align:=1;
-  align:=1 shl align;
+  align:=QWORD(1) shl align;
  end else
  begin
   //Address range must be all in user VM space.
@@ -564,11 +549,11 @@ begin
  Result:=entry;
 end;
 
-procedure dmem_vmo_get_type(map:vm_map_t;
+procedure dmem_vmo_get_info(map  :vm_map_t;
                             entry:vm_map_entry_t;
-                            addr:QWORD;
+                            addr :QWORD;
                             qinfo:pSceKernelVirtualQueryInfo;
-                            sdk_version_big_4ffffff:Boolean);
+                            has_sdk_version_5:Boolean);
 var
  obj:vm_map_object;
  start:QWORD;
@@ -598,13 +583,17 @@ begin
 
  obj:=entry^.vm_obj;
 
- if (obj<>nil) and (obj^.otype=OBJT_BLOCKPOOL) then
+ if (obj<>nil) then
+ if (obj^.otype=OBJT_BLOCKPOOL) then
  begin
   qinfo^.bits.isPooledMemory:=1;
 
-  Assert(false,'dmem_vmo_get_type:OBJT_BLOCKPOOL');
+  qinfo^.pstart    :=Pointer(entry^.start);
+  qinfo^.p__end    :=Pointer(entry^.__end);
 
-  //qinfo^.bits:=qinfo->bits and $ef or ((ret1 and 1) shl 4);
+  ret:=blockpool_obj_get_info(map,obj,addr,qinfo,has_sdk_version_5);
+
+  qinfo^.bits.isCommitted:=ret;
   qinfo^.offset:=QWORD(qinfo^.pstart) - entry^.start;
   Exit;
  end;
@@ -621,6 +610,7 @@ begin
   begin
    offset:=entry^.offset;
 
+   //exclude VM_PROT_EXECUTE
    qinfo^.protection:=qinfo^.protection and (VM_PROT_GPU_ALL or VM_PROT_RW);
 
    start :=entry^.start;
@@ -631,7 +621,7 @@ begin
     addr:=start;
    end;
 
-   ret:=dmem_map_get_mtype(dmem_maps[p_proc.p_pool_id].dmem,
+   ret:=dmem_map_get_mtype(dmem_maps[p_proc.p_dmem_pool_id].dmem,
                            obj,
                            addr + (entry^.offset - start), //send not transformed offset
                            @d_start2,@d_end2,
@@ -668,7 +658,11 @@ begin
   if (OBJT_PHYSHM < otype) then Exit;
 
   case otype of
-   OBJT_DEFAULT,
+   OBJT_DEFAULT:
+     begin
+      //fake shared
+      if obj^.fakeshared then Exit;
+     end;
    OBJT_SWAP   ,
    OBJT_VNODE  ,
    OBJT_JITSHM ,
@@ -732,7 +726,7 @@ var
  entry,next:vm_map_entry_t;
  rbp:PPointer;
  rip:Pointer;
- sdk_version_big_4ffffff:Boolean;
+ has_sdk_version_5:Boolean;
  is_libsys_call:Boolean;
  is_found:Boolean;
  qinfo:SceKernelVirtualQueryInfo;
@@ -742,7 +736,7 @@ begin
  td:=curkthread;
  if (td=nil) then Exit(-1);
 
- Writeln('sys_virtual_query:',HexStr(addr),' ',flags);
+ //Writeln('sys_virtual_query:',HexStr(addr),' ',flags);
 
  QWORD(addr):=QWORD(addr) and QWORD(not PAGE_MASK);
 
@@ -759,8 +753,8 @@ begin
  repeat
   if ((QWORD(rbp) shr 47)<>0) then
   begin
-   sdk_version_big_4ffffff:=(p_proc.p_sdk_version > $4ffffff);
-   is_libsys_call        :=false;
+   has_sdk_version_5:=(p_proc.p_sdk_version >= $5000000);
+   is_libsys_call   :=false;
    Break;
   end;
 
@@ -770,8 +764,8 @@ begin
   if (QWORD(rip)=QWORD(-1)) or
      (QWORD(rbp)=QWORD(-1)) then
   begin
-   sdk_version_big_4ffffff:=(p_proc.p_sdk_version > $4ffffff);
-   is_libsys_call         :=false;
+   has_sdk_version_5:=(p_proc.p_sdk_version >= $5000000);
+   is_libsys_call   :=false;
    Break;
   end;
 
@@ -780,12 +774,12 @@ begin
   begin
    if ((QWORD(rip) - QWORD($7f0000000)) < QWORD($800000000)) then //ET_DYN_LOAD_ADDR_SYS
    begin
-    sdk_version_big_4ffffff:=true;
-    is_libsys_call         :=true;
+    has_sdk_version_5:=true;
+    is_libsys_call   :=true;
    end else
    begin
-    sdk_version_big_4ffffff:=(p_proc.p_sdk_version > $4ffffff);
-    is_libsys_call         :=false;
+    has_sdk_version_5:=(p_proc.p_sdk_version >= $5000000);
+    is_libsys_call   :=false;
    end;
    Break;
   end;
@@ -795,11 +789,11 @@ begin
 
  vm_map_lock(map);
 
- vm_map_lookup_entry(map,QWORD(addr),@entry);
+ is_found:=vm_map_lookup_entry(map,QWORD(addr),@entry);
 
  entry:=next_valid_entry(map,entry);
 
- is_found:=(QWORD(addr)>=entry^.start) and (QWORD(addr)<entry^.__end);
+ is_found:=(entry<>@map^.header) and (QWORD(addr)>=entry^.start) and (QWORD(addr)<entry^.__end);
 
  if not is_found then
  begin
@@ -826,18 +820,18 @@ begin
 
  if is_libsys_call or
     ((entry^.start shr 28) < 127) or
-    (entry^.__end > QWORD($ff0000000)) then
+    (entry^.__end > QWORD($ff0000000)) then  //SCE_KERNEl_GNM_TESS_AREA
  begin
   _dmem_vmo_get_type:
 
-  dmem_vmo_get_type(map,entry,QWORD(addr),@qinfo,sdk_version_big_4ffffff);
+  dmem_vmo_get_info(map,entry,QWORD(addr),@qinfo,has_sdk_version_5);
 
   vm_map_unlock(map);
 
   size:=$48;
   if (infoSize < $48) then
   begin
-   size:=infoSize and $ffffffff;
+   size:=DWORD(infoSize);
   end;
  end else
  begin
@@ -857,7 +851,7 @@ begin
    qinfo.memoryType:=0;
    qinfo.bits.isFlexibleMemory:=1;
 
-   size:=infoSize and $ffffffff;
+   size:=DWORD(infoSize);
    if (infoSize > $47) then
    begin
     size:=$48;
@@ -881,7 +875,7 @@ begin
    qinfo.memoryType:=0;
    qinfo.bits.isFlexibleMemory:=1;
 
-   size:=infoSize and $ffffffff;
+   size:=DWORD(infoSize);
    if (infoSize > $47) then
    begin
     size:=$48;
@@ -896,10 +890,10 @@ begin
    end;
 
    start:=entry^.start;
-   while (start > QWORD($7efffffff)) and (entry^.__end < QWORD($ff0000001)) do
+   while (start >= QWORD($7f0000000)) and (entry^.__end <= QWORD($ff0000000)) do
    begin
     next:=next_valid_entry(map,entry^.next);
-    if (next<>@map^.header) then
+    if (next=@map^.header) then
     begin
      vm_map_unlock(map);
      Exit(EACCES);
@@ -927,6 +921,78 @@ begin
 
 
  Result:=copyout(@qinfo,info,size);
+end;
+
+function sys_query_memory_protection(addr:Pointer;info:Pointer):Integer;
+label
+ _simple;
+var
+ map:vm_map_t;
+ _addr:vm_offset_t;
+ __end:vm_offset_t;
+ entry:vm_map_entry_t;
+ data:t_query_memory_prot;
+ qinfo:SceKernelVirtualQueryInfo;
+ is_found:Boolean;
+begin
+ Result:=EINVAL;
+ _addr:=trunc_page(vm_offset_t(addr));
+ map:=p_proc.p_vmspace;
+ __end:=vm_map_max(map);
+
+ if (_addr<__end) or (_addr=__end) then
+ begin
+  vm_map_lock(map);
+
+  is_found:=vm_map_lookup_entry(map,QWORD(addr),@entry);
+
+  entry:=next_valid_entry(map,entry);
+
+  is_found:=(entry<>@map^.header) and (QWORD(addr)>=entry^.start) and (QWORD(addr)<entry^.__end);
+
+  if not is_found then
+  begin
+   vm_map_unlock(map);
+   Result:=EACCES;
+  end else
+  begin
+
+   if (entry^.vm_obj=nil) or
+      (p_proc.p_sdk_version < $10000000) then
+   begin
+    //private
+    _simple:
+
+    data.start:=Pointer(entry^.start);
+    data.__end:=Pointer(entry^.__end);
+    data.prot:=(entry^.max_protection and entry^.protection);
+    data.eflags:=entry^.eflags;
+
+    if (entry^.vm_obj<>nil) then
+    if ((entry^.vm_obj^.flags and OBJ_DMEM_EXT)<>0) then
+    begin
+     //exclude VM_PROT_EXECUTE
+     data.prot:=data.prot and (VM_PROT_GPU_ALL or VM_PROT_RW);
+    end;
+
+   end else
+   if (entry^.vm_obj^.otype<>OBJT_BLOCKPOOL) then
+   begin
+    //object
+    goto _simple;
+   end else
+   begin
+    dmem_vmo_get_info(map,entry,QWORD(addr),@qinfo,True);
+    data.start:=qinfo.pstart;
+    data.__end:=qinfo.p__end;
+    data.prot :=qinfo.protection;
+    data.eflags:=entry^.eflags;
+   end;
+
+   vm_map_unlock(map);
+   Result:=copyout(@data,info,SizeOf(t_query_memory_prot));
+  end;
+ end;
 end;
 
 function obj2dmem(obj:vm_object_t):p_dmem_map; public;

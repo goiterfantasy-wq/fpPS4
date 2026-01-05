@@ -7,7 +7,7 @@ interface
 
 uses
  mqueue,
- hamt,
+ kern_hamt,
  //g23tree,
  g_node_splay,
  murmurhash,
@@ -45,10 +45,18 @@ type
 
  p_jinstr_len=^t_jinstr_len;
  t_jinstr_len=packed record
-  original:0..31;  //5
-  LF_JMP  :0..1;
-  bit6    :0..1;
-  recompil:0..511; //9
+  original   :0..15;  //4
+  CAN_RESTART:0..1;
+  bit5       :0..1;
+  bit6       :0..1;
+  recompil   :0..511; //9
+ end;
+
+ p_jit_addr_info=^t_jit_addr_info;
+ t_jit_addr_info=packed record
+  original:QWORD;
+  recompil:QWORD;
+  jflags  :t_jinstr_len;
  end;
 
  p_jcode_chunk=^t_jcode_chunk;
@@ -72,7 +80,7 @@ type
   procedure dec_ref(name:pchar);
   function  is_mark_del:Boolean;
   function  find_host_by_guest(addr:QWORD):QWORD;
-  function  find_guest_by_host(addr:QWORD):QWORD;
+  function  find_guest_by_host(addr:QWORD;info:p_jit_addr_info):Boolean;
   function  cross_guest(c_start,c___end:QWORD):Boolean;
   function  cross_host (c_start,c___end:QWORD):Boolean;
  end;
@@ -122,7 +130,7 @@ type
   procedure dec_ref(name:pchar);
   procedure inc_attach_count;
   function  dec_attach_count:Boolean;
-  function  find_guest_by_host(addr:QWORD):QWORD;
+  function  find_guest_by_host(addr:QWORD;info:p_jit_addr_info):Boolean;
   function  cross_host(c_start,c___end:QWORD):Boolean;
   procedure Free;
   function  add_entry_point(src,dst:Pointer):p_jit_entry_point;
@@ -151,9 +159,28 @@ type
 
 function new_blob(_size:ptruint):p_jit_dynamic_blob;
 
+type
+ //[18] + [6]*5 =48
+ HAMT48=object
+  type
+   TBitKey=QWORD;
+  const
+   root_bits=18;
+   root_size=TBitKey(1) shl TBitKey(root_bits);
+   root_mask=TBitKey(root_size)-TBitKey(1);
+ end;
+
+ TNestedNode48=record
+  case Byte of
+   0:(node:THAMTNode64;
+      lock:Pointer);
+   1:(line:array[0..63] of Byte);
+ end;
+
+ TSTUB_HAMT48=array[0..HAMT48.root_mask] of TNestedNode48;
+
 var
- entry_hamt_lock:Pointer=nil;
- entry_hamt:TSTUB_HAMT64;
+ entry_hamt:TSTUB_HAMT48;
 
  entry_chunk_lock:Pointer=nil;
 
@@ -166,7 +193,7 @@ function  exist_entry(src:Pointer):Boolean;
 
 function  fetch_chunk_by_guest(src:Pointer):p_jcode_chunk;
 function  fetch_blob_by_host(src:Pointer):p_jit_dynamic_blob;
-function  exist_jit_host(src:Pointer;tf_tip:PQWORD):Boolean;
+function  exist_jit_host(src:Pointer;info:p_jit_addr_info):Boolean;
 
 function  next_chunk(node:p_jcode_chunk;src:Pointer):p_jcode_chunk;
 //procedure unmap_jit_cache(start,__end:QWORD);
@@ -187,8 +214,10 @@ implementation
 uses
  sysutils,
  vmparam,
+ signal,
  sys_bootparam,
  kern_proc,
+ uma,
  vm,
  vm_map,
  vm_pmap_prot,
@@ -277,12 +306,19 @@ begin
  //td^.td_jctx.block:=nil;
  //kmem_free(td^.td_jctx.call_ret_cache,64*1024);
  //td^.td_jctx.call_ret_cache:=nil;
+
+ if (td^.td_jctx.lacuna.chnk<>nil) then
+ begin
+  p_free(td^.td_jctx.lacuna.chnk);
+  td^.td_jctx.lacuna:=Default(t_lacuna);
+ end;
 end;
 
 procedure switch_to_jit(td:p_kthread); public;
 label
  _host,
- _start;
+ _start,
+ _no_preload;
 var
  node:p_jit_entry_point;
  jctx:p_td_jctx;
@@ -300,6 +336,15 @@ begin
  begin
   //jit mode
 
+  if (td^.td_frame.tf_flags and TF_JIT_RIP)<>0 then
+  begin
+   //rip in jit addr
+   //
+   td^.td_frame.tf_flags:=td^.td_frame.tf_flags and (not TF_JIT_RIP);
+   //
+   node:=nil;
+   goto _no_preload;
+  end else
   if is_guest_addr(td^.td_frame.tf_rip) then
   begin
    //jit->jit
@@ -353,11 +398,11 @@ begin
   goto _start;
  end;
 
+ _no_preload:
+
  jctx:=@td^.td_jctx;
 
  frame:=@td^.td_frame.tf_r13;
-
- //jctx^.block:=node^.blob;
 
  if (jctx^.rsp=nil) then
  begin
@@ -377,18 +422,17 @@ begin
  end;
  Assert(jctx^.call_ret_cache<>nil,'call_ret_cache aalocation fail');
 
- //tf_r14 not need to move
- //tf_r15 not need to move
-
- frame^.tf_r13:=td^.td_frame.tf_r13;
- frame^.tf_rsp:=td^.td_frame.tf_rsp;
- frame^.tf_rbp:=td^.td_frame.tf_rbp;
+ set_jit_ctx_state(@td^.td_frame,True);
 
  td^.td_frame.tf_rsp:=QWORD(td^.td_kstack.stack);
  td^.td_frame.tf_rbp:=QWORD(td^.td_kstack.stack);
 
- td^.td_frame.tf_rip:=QWORD(node^.dst);
  td^.td_frame.tf_r13:=QWORD(frame);
+
+ if (node<>nil) then //have fetch_entry/preload?
+ begin
+  td^.td_frame.tf_rip:=QWORD(node^.dst);
+ end;
 
  set_pcb_flags(td,PCB_FULL_IRET or PCB_IS_JIT);
 
@@ -403,7 +447,10 @@ begin
  //teb stack
 
  //
- node^.dec_ref('fetch_entry')
+ if (node<>nil) then
+ begin
+  node^.dec_ref('fetch_entry')
+ end;
 end;
 
 function fetch_chunk_by_guest(src:Pointer):p_jcode_chunk;
@@ -555,17 +602,17 @@ begin
  rw_runlock(entry_chunk_lock);
 end;
 
-function exist_jit_host(src:Pointer;tf_tip:PQWORD):Boolean; public;
+function exist_jit_host(src:Pointer;info:p_jit_addr_info):Boolean;
 var
  blob:p_jit_dynamic_blob;
 begin
  blob:=fetch_blob_by_host(src);
  if (blob<>nil) then
  begin
-  if (tf_tip<>nil) then
+  if (info<>nil) then
   begin
    rw_rlock(blob^.lock);
-   tf_tip^:=blob^.find_guest_by_host(QWORD(src));
+   blob^.find_guest_by_host(QWORD(src),info);
    rw_runlock(blob^.lock);
   end;
   blob^.dec_ref('fetch_blob_by_host');
@@ -683,6 +730,7 @@ var
  jctx :p_td_jctx;
  curr :p_jit_dynamic_blob;
  cache:p_jplt_cache;
+ info:t_jit_addr_info;
 begin
  td:=curkthread;
  if (td=nil) then Exit(nil);
@@ -699,8 +747,10 @@ begin
   end else
   if ((QWORD(addr) and UNRESOLVE_MAGIC_MASK)=UNRESOLVE_MAGIC_ADDR) then
   begin
-   if exist_jit_host(from,@td^.td_frame.tf_rip) then
+   if exist_jit_host(from,@info) then
    begin
+    td^.td_frame.tf_rip  :=info.original;
+    td^.td_frame.tf_flags:=td^.td_frame.tf_flags and (not TF_JIT_RIP);
     test_unresolve_symbol(td,addr);
    end;
   end;
@@ -883,7 +933,7 @@ begin
   original:=QWORD(next)-QWORD(curr);
   recompil:=link_next.offset-link_curr.offset;
 
-  if (original>16) or (recompil>512) then
+  if (original>15) or (recompil>511) then
   begin
    Writeln('0x',HexStr(curr));
    Writeln(original,':',recompil);
@@ -893,7 +943,7 @@ begin
   table[i].original:=Byte(original);
   table[i].recompil:=Byte(recompil);
 
-  table[i].LF_JMP  :=ord((clabel^.flags and LF_JMP)<>0);
+  table[i].CAN_RESTART:=ord((clabel^.flags and CAN_RESTART)<>0);
 
   {
   writeln('|0x',HexStr(curr),'..',HexStr(next),
@@ -1090,11 +1140,15 @@ end;
 function fetch_entry(src:Pointer):p_jit_entry_point;
 var
  data:PPointer;
+ map:DWORD;
 begin
  Result:=nil;
- rw_rlock(entry_hamt_lock);
 
- data:=HAMT_search64(@entry_hamt,QWORD(src));
+ map:=QWORD(src) and HAMT48.root_mask;
+
+ rw_rlock(entry_hamt[map].lock);
+
+ data:=_HAMT_search64(@entry_hamt[map].node,QWORD(src),HAMT48.root_bits);
  if (data<>nil) then
  begin
   Result:=data^;
@@ -1105,7 +1159,7 @@ begin
   Result^.inc_ref('fetch_entry');
  end;
 
- rw_runlock(entry_hamt_lock);
+ rw_runlock(entry_hamt[map].lock);
 end;
 
 function exist_entry(src:Pointer):Boolean;
@@ -1193,18 +1247,20 @@ begin
  Result:=(System.InterlockedDecrement(attach_count)=0);
 end;
 
-function t_jit_dynamic_blob.find_guest_by_host(addr:QWORD):QWORD;
+function t_jit_dynamic_blob.find_guest_by_host(addr:QWORD;info:p_jit_addr_info):Boolean;
 var
  node:p_jcode_chunk;
 begin
  //Writeln('_ind_guest_by_host:0x',HexStr(base),' 0x',HexStr(base+size),' 0x',HexStr(addr,16));
 
- Result:=0;
+ Result:=False;
  node:=chunk_list;
  while (node<>nil) do
  begin
-  Result:=node^.find_guest_by_host(addr);
-  if (Result<>0) then Exit;
+  if node^.find_guest_by_host(addr,info) then
+  begin
+   Exit(True);
+  end;
 
   node:=node^.next;
  end;
@@ -1235,10 +1291,31 @@ begin
  FreeMem(@Self);
 end;
 
+var
+ jit_entry_point_zone:uma_zone_t=nil;
+
+function alloc_entry_point:p_jit_entry_point;
+var
+ zone:uma_zone_t;
+begin
+ if (jit_entry_point_zone=nil) then
+ begin
+  zone:=uma_zcreate('jit_entry_point',sizeof(t_jit_entry_point), nil, nil, nil, nil, UMA_ALIGN_PTR, 0);
+
+  if System.InterlockedCompareExchange(Pointer(jit_entry_point_zone),Pointer(zone),nil)<>nil then
+  begin
+   uma_zdestroy(zone);
+  end;
+ end;
+
+ Result:=uma_zalloc(jit_entry_point_zone, M_WAITOK or M_ZERO);
+end;
+
 function t_jit_dynamic_blob.add_entry_point(src,dst:Pointer):p_jit_entry_point;
 begin
  if (src=nil) or (dst=nil) then Exit;
- Result:=AllocMem(Sizeof(t_jit_entry_point));
+
+ Result:=alloc_entry_point;
  Result^.next:=entry_list;
  Result^.blob:=@Self;
  Result^.src :=src;
@@ -1249,7 +1326,7 @@ end;
 
 procedure t_jit_dynamic_blob.free_entry_point(node:p_jit_entry_point);
 begin
- FreeMem(node);
+ uma_zfree(jit_entry_point_zone, node);
 end;
 
 procedure t_jit_dynamic_blob.init_plt;
@@ -1355,6 +1432,8 @@ begin
 
 end;
 
+procedure free_plt_cache(node:p_jplt_cache); forward;
+
 procedure t_jit_dynamic_blob.detach_all_curr;
 var
  node:p_jplt_cache;
@@ -1376,7 +1455,7 @@ begin
   end;
 
   //TODO: GC FREE
-  FreeMem(node);
+  free_plt_cache(node);
 
   node:=jpltc_curr.Min;
  end;
@@ -1437,6 +1516,31 @@ begin
    end;
 
  threads_unlock;
+end;
+
+var
+ jplt_cache_zone:uma_zone_t=nil;
+
+function alloc_plt_cache:p_jplt_cache;
+var
+ zone:uma_zone_t;
+begin
+ if (jplt_cache_zone=nil) then
+ begin
+  zone:=uma_zcreate('jplt_cache',sizeof(t_jplt_cache), nil, nil, nil, nil, UMA_ALIGN_PTR, 0);
+
+  if System.InterlockedCompareExchange(Pointer(jplt_cache_zone),Pointer(zone),nil)<>nil then
+  begin
+   uma_zdestroy(zone);
+  end;
+ end;
+
+ Result:=uma_zalloc(jplt_cache_zone, M_WAITOK or M_ZERO);
+end;
+
+procedure free_plt_cache(node:p_jplt_cache);
+begin
+ uma_zfree(jplt_cache_zone, node);
 end;
 
 function t_jit_dynamic_blob.add_plt_cache(plt:p_jit_plt;src,dst:Pointer;dest_block:p_jit_dynamic_blob):p_jplt_cache;
@@ -1501,7 +1605,7 @@ begin
    Break;
   end else
   begin
-   Result:=AllocMem(Sizeof(t_jplt_cache));
+   Result:=alloc_plt_cache;
    Result^.plt:=plt; //key
    Result^.src:=src; //key
    Result^.neg:=Pointer(-QWORD(src));
@@ -1529,7 +1633,7 @@ begin
     Break;
    end else
    begin
-    FreeMem(Result);
+    free_plt_cache(Result);
     Result:=nil;
    end;
   end;
@@ -1601,12 +1705,12 @@ begin
  end;
 end;
 
-function t_jcode_chunk.find_guest_by_host(addr:QWORD):QWORD;
+function t_jcode_chunk.find_guest_by_host(addr:QWORD;info:p_jit_addr_info):Boolean;
 var
  i,src,dst:QWORD;
  _table:p_jinstr_len;
 begin
- Result:=0;
+ Result:=False;
  //Writeln('find_guest_by_host:0x',HexStr(dest,16),' 0x',HexStr(d_end,16),' 0x',HexStr(addr,16));
  if (addr>=dest) and (addr<=d_end) then
  if (count<>0) then
@@ -1617,13 +1721,19 @@ begin
   For i:=0 to count-1 do
   begin
 
-   if (addr>=dst) then
-   begin
-    Result:=src;
-   end else
    if (dst>addr) then
    begin
     Exit;
+   end else
+   if {(addr>=dst) and} (addr<(dst+_table[i].recompil)) then
+   begin
+    if (info<>nil) then
+    begin
+     info^.original:=src;
+     info^.recompil:=dst;
+     info^.jflags  :=_table[i];
+    end;
+    Exit(True);
    end;
 
    src:=src+_table[i].original;
@@ -1648,22 +1758,27 @@ procedure t_jit_dynamic_blob.attach_entry(node:p_jit_entry_point);
 var
  data:PPointer;
  old:p_jit_entry_point;
+ map:DWORD;
 begin
  node^.inc_ref('attach_entry');
  self.inc_attach_count;
 
  old:=nil;
 
- rw_wlock(entry_hamt_lock);
-  data:=HAMT_insert64(@entry_hamt,QWORD(node^.src),node);
+ map:=QWORD(node^.src) and HAMT48.root_mask;
+
+ rw_wlock(entry_hamt[map].lock);
+  data:=_HAMT_insert64(@entry_hamt[map].node,QWORD(node^.src),HAMT48.root_bits,node);
   Assert(data<>nil);
   if (data^<>node) then
   begin
    old:=data^;
    data^:=node;
+   old^.entry_public:=0;
+   self.dec_attach_count;
   end;
   node^.entry_public:=1;
- rw_wunlock(entry_hamt_lock);
+ rw_wunlock(entry_hamt[map].lock);
 end;
 
 procedure t_jit_dynamic_blob.attach_all_entry;
@@ -1713,14 +1828,17 @@ end;
 function t_jit_dynamic_blob.detach_entry(node:p_jit_entry_point):Boolean;
 var
  old:p_jit_entry_point;
+ map:DWORD;
 begin
  if (node^.entry_public=0) then Exit;
 
  old:=nil;
 
- rw_wlock(entry_hamt_lock);
-  HAMT_delete64(@entry_hamt,QWORD(node^.src),@old);
- rw_wunlock(entry_hamt_lock);
+ map:=QWORD(node^.src) and HAMT48.root_mask;
+
+ rw_wlock(entry_hamt[map].lock);
+  _HAMT_delete64(@entry_hamt[map].node,QWORD(node^.src),HAMT48.root_bits,@old);
+ rw_wunlock(entry_hamt[map].lock);
 
  if (old=node) then
  begin

@@ -197,6 +197,20 @@ type
   Constructor Create; override;
  end;
 
+ TPS4Audio=class(TAbstractObject)
+ private
+  FMainDevice      :RawByteString;
+  FHeadphoneDevice :RawByteString;
+  FControllerDevice:RawByteString;
+  FSpecialDevice   :RawByteString;
+ published
+  property MainDevice      :RawByteString read FMainDevice       write FMainDevice      ;
+  property HeadphoneDevice :RawByteString read FHeadphoneDevice  write FHeadphoneDevice ;
+  property ControllerDevice:RawByteString read FControllerDevice write FControllerDevice;
+  property SpecialDevice   :RawByteString read FSpecialDevice    write FSpecialDevice   ;
+ public
+ end;
+
  TPS4LoadExec=class(TAbstractObject)
  private
   FPath:RawByteString;
@@ -215,6 +229,7 @@ type
    FMiscInfo        :TMiscInfo;
    FVulkanInfo      :TVulkanInfo;
    FPS4SystemService:TPS4SystemService;
+   FPS4Audio        :TPS4Audio;
   published
    property MainInfo        :TMainInfo         read FMainInfo         write FMainInfo;
    property BootParamInfo   :TBootParamInfo    read FBootParamInfo    write FBootParamInfo;
@@ -222,6 +237,7 @@ type
    property MiscInfo        :TMiscInfo         read FMiscInfo         write FMiscInfo;
    property VulkanInfo      :TVulkanInfo       read FVulkanInfo       write FVulkanInfo;
    property PS4SystemService:TPS4SystemService read FPS4SystemService write FPS4SystemService;
+   property PS4Audio        :TPS4Audio         read FPS4Audio         write FPS4Audio;
  end;
 
  TGameInfo=class(TAbstractObject)
@@ -267,12 +283,14 @@ type
    FReader               :Boolean;
    FhasParamSfo          :Byte;
    FRequiredHdcpType     :Byte;
+   FLoadExec             :Boolean;
    FPipe                 :THandle;
    FConfInfo             :TConfigInfo;
    FGameItem             :TGameItem;
    FLocalDir             :RawByteString;
    FCATEGORY             :RawByteString;
    FTITLE                :RawByteString;
+   FTITLE_ID             :RawByteString;
    FCONTENT_ID           :RawByteString;
    FINSTALL_DIR_SAVEDATA :RawByteString;
    FAPP_VER              :RawByteString;
@@ -288,6 +306,7 @@ type
    property    LocalDir             :RawByteString read FLocalDir              write FLocalDir;
    property    CATEGORY             :RawByteString read FCATEGORY              write FCATEGORY;
    property    TITLE                :RawByteString read FTITLE                 write FTITLE;
+   property    TITLE_ID             :RawByteString read FTITLE_ID              write FTITLE_ID;
    property    CONTENT_ID           :RawByteString read FCONTENT_ID            write FCONTENT_ID;
    property    INSTALL_DIR_SAVEDATA :RawByteString read FINSTALL_DIR_SAVEDATA  write FINSTALL_DIR_SAVEDATA;
    property    APP_VER              :RawByteString read FAPP_VER               write FAPP_VER;
@@ -300,6 +319,7 @@ type
    property    DownloadMb_1         :DWORD         read FDownloadMb_1          write FDownloadMb_1;
    property    hasParamSfo          :Byte          read FhasParamSfo           write FhasParamSfo;
    property    RequiredHdcpType     :Byte          read FRequiredHdcpType      write FRequiredHdcpType;
+   property    LoadExec             :Boolean       read FLoadExec              write FLoadExec;
   public
    Constructor Create(Reader:Boolean); reintroduce;
    Destructor  Destroy; override;

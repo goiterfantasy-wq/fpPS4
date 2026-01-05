@@ -29,8 +29,9 @@ uses
 type
  TEmitFetch=class(TEmitFlow)
   //
+  function  GroupingSImm  (regs:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
   function  GroupingVImm  (regs:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
-  function  TryShortVSharp(regs:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
+  function  TryShortVSharp(inps:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
   function  GroupingSharp (src :PPsrRegSlot;rtype:TsrResourceType):TsrDataLayout;
   //
   function  get_sdst7(SDST:Byte):PsrRegSlot;
@@ -51,6 +52,7 @@ type
   function  fetch_ssrc9_pair(SSRC:Word;src:PPsrRegNode;rtype:TsrDataType):Boolean;
   function  fetch_ssrc9_64(SSRC:Word;rtype:TsrDataType):TsrRegNode;
   function  fetch_vsrc8(VSRC:Word;rtype:TsrDataType):TsrRegNode;
+  function  fetch_vsrc8_64(VSRC:Word;rtype:TsrDataType):TsrRegNode;
   function  fetch_vdst8(VDST:Word;rtype:TsrDataType):TsrRegNode;
   function  fetch_vdst8_64(VDST:Word;rtype:TsrDataType):TsrRegNode;
   //
@@ -85,12 +87,100 @@ function  GetInputRegNode(node:TsrRegNode):TsrInput;
 
 implementation
 
-function GetInputRegNode(node:TsrRegNode):TsrInput;
+uses
+ srPrivate;
+
+type
+ a_volatile_node=array of TsrRegNode;
+
+procedure add_node(var A:a_volatile_node;node:TsrRegNode);
 var
- pSource:TsrNode;
+ i:Integer;
 begin
- pSource:=GetSourceRegNode(node);
- Result:=pSource.specialize AsType<ntInput>;
+ //check exist
+ if Length(A)<>0 then
+ For i:=0 to High(A) do
+ begin
+  if (A[i]=node) then Exit;
+ end;
+ //
+ Insert([node],A,High(A));
+end;
+
+procedure add_volatile(var A:a_volatile_node;V:TsrVolatile);
+var
+ node:TStoreNode;
+begin
+ node:=V.FList.pHead;
+ while (node<>nil) do
+ begin
+  add_node(A,RegDown(node.src));
+  //
+  node:=node.pNext;
+ end;
+end;
+
+function next_volatile(var A:a_volatile_node;var i:Integer):TsrRegNode;
+begin
+ if (i<Length(A)) then
+ begin
+  Result:=A[i];
+  Inc(i);
+ end else
+ begin
+  Result:=nil;
+ end;
+end;
+
+type
+ AsrInput=array of TsrInput;
+
+function GetInputRegNode2(node:TsrRegNode):AsrInput;
+var
+ V:TsrVolatile;
+ C:TsrInput;
+ pSource:TsrNode;
+ A:a_volatile_node;
+ i:Integer;
+begin
+ Result:=[];
+ A:=[];
+ i:=0;
+
+ while (node<>nil) do
+ begin
+  node:=RegDown(node);
+
+  while node.pWriter.IsType(TsrVolatile) do
+  begin
+   V:=node.pWriter.specialize AsType<TsrVolatile>;
+   add_volatile(A,V);
+   node:=next_volatile(A,i);
+  end;
+
+  pSource:=GetSourceRegNode(node);
+
+  if pSource.IsType(ntInput) then
+  begin
+   C:=pSource.specialize AsType<ntInput>;
+   Insert([C],Result,High(Result));
+  end;
+
+  node:=next_volatile(A,i);
+ end;
+end;
+
+function GetInputRegNode(node:TsrRegNode):TsrInput;
+Var
+ A:AsrInput;
+begin
+ A:=GetInputRegNode2(node);
+ if (Length(A)=0) then Exit(nil);
+ if (Length(A)>1) then
+ begin
+  Assert(false,'Multiple reachable inputs are not supported!');
+ end;
+ Result:=A[0];
 end;
 
 //
@@ -122,6 +212,36 @@ begin
  if (pair=nil) then Exit;
 
  Result:=pair.pWriter.specialize AsType<ntConst>;
+end;
+
+function TEmitFetch.GroupingSImm(regs:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
+var
+ ssharp:TSSharpResource4;
+
+ i:Integer;
+ imm:TsrConst;
+begin
+ Result:=nil;
+
+ if (rtype<>rtSSharp4) then Exit;
+
+ // S_MOV_B32  s30, #0x05000000
+ // S_MOV_B32  s31, 2.0
+ // S_MOVK_I32 s28, 146
+ // S_BFM_B32  s29, 12, 12
+
+ ssharp:=Default(TSSharpResource4);
+
+ For i:=0 to 3 do
+ begin
+  imm:=GetRegConst(regs[i]);
+  if (imm=nil) then Exit;
+  PDWORD(@ssharp)[i]:=imm.AsInt32;
+ end;
+
+ //print_ssharp4(@ssharp);
+
+ Result:=DataLayoutList.FetchImm(@ssharp,rtype);
 end;
 
 function TEmitFetch.GroupingVImm(regs:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
@@ -288,15 +408,54 @@ begin
  Result:=True;
 end;
 
-function TEmitFetch.TryShortVSharp(regs:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
+function TEmitFetch.TryShortVSharp(inps:PPsrRegNode;rtype:TsrResourceType):TsrDataLayout;
 var
+ regs:array[0..3] of TsrRegNode;
+
  chain:TsrChains;
- reg:TsrRegNode;
+ reg,tmp:TsrRegNode;
  pImm:TsrConst;
- V2,V3:DWORD;
+ pLine:TspirvOp;
+ V1,V2,V3:DWORD;
 begin
  Result:=nil;
  if (rtype<>rtVSharp4) then Exit;
+
+ regs[0]:=inps[0];
+ regs[1]:=inps[1];
+ regs[2]:=inps[2];
+ regs[3]:=inps[3];
+
+ V1:=0;
+
+ reg:=RegDown(regs[1]);
+ pLine:=reg.pWriter.specialize AsType<ntOp>;
+ if (pLine<>nil) then
+ if (pLine.OpId=Op.OpBitwiseOr) then
+ begin
+  tmp:=RegDown(pLine.ParamNode(0).AsReg);
+  pImm:=tmp.AsConst;
+
+  if (pImm<>nil) then
+  begin
+   regs[1]:=RegDown(pLine.ParamNode(1).AsReg);
+
+   V1:=pImm.AsUint32;
+  end else
+  begin
+   tmp:=RegDown(pLine.ParamNode(1).AsReg);
+   pImm:=tmp.AsConst;
+
+   if (pImm<>nil) then
+   begin
+    regs[1]:=RegDown(pLine.ParamNode(0).AsReg);
+
+    V1:=pImm.AsUint32;
+   end;
+
+  end;
+
+ end;
 
  reg:=RegDown(regs[2]);
 
@@ -316,10 +475,11 @@ begin
  chain[0]:=GetChainRegNode(regs[0]);
  chain[1]:=GetChainRegNode(regs[1]);
 
- Result:=DataLayoutList.Grouping(chain,rtVSharp2);
+ Result:=DataLayoutList.Grouping(chain,rtVSharp2,V1);
 
  if (Result<>nil) then
  begin
+  Result.FData[1]:=Result.FData[1] or V1;
   Result.FData[2]:=V2;
   Result.FData[3]:=V3;
  end;
@@ -342,6 +502,9 @@ begin
  begin
   regs[i]:=RegDown(src[i]^.current);
  end;
+
+ Result:=GroupingSImm(@regs,rtype);
+ if (Result<>nil) then Exit;
 
  Result:=GroupingVImm(@regs,rtype);
  if (Result<>nil) then Exit;
@@ -500,6 +663,21 @@ begin
  Assert(Result<>nil,'fetch_vsrc8');
 end;
 
+function TEmitFetch.fetch_vsrc8_64(VSRC:Word;rtype:TsrDataType):TsrRegNode;
+var
+ src:array[0..1] of TsrRegNode;
+begin
+ src[0]:=fetch_vsrc8(VSRC+0,dtUint32);
+ src[1]:=fetch_vsrc8(VSRC+1,dtUint32);
+
+ if (src[0]=nil) or (src[1]=nil) then
+ begin
+  Assert(False);
+ end;
+
+ Result:=fetch64(@src,rtype);
+end;
+
 function TEmitFetch.fetch_vdst8(VDST:Word;rtype:TsrDataType):TsrRegNode;
 var
  src:PsrRegSlot;
@@ -595,6 +773,7 @@ const
  fcInfinity = fcPositiveInfinity or fcNegativeInfinity;
  fcNegative = fcNegativeInfinity or fcNegativeNormal or fcNegativeDenorm or fcNegativeZero;
  fcPositive = fcPositiveZero     or fcPositiveDenorm or fcPositiveNormal or fcPositiveInfinity;
+ fcFinite   = (fcNegative or fcPositive) and (not fcInfinity);
 
 procedure TEmitFetch.OpCmpClass(dst0,dst1:PsrRegSlot;src0,src1:TsrRegNode);
 var
@@ -605,12 +784,23 @@ var
  msk:TsrConst;
  val:DWORD;
 
- function _test_group(val,mask:DWORD):Boolean; inline;
+ function test_group(val,mask:DWORD):Boolean; inline;
  var
   i:DWORD;
  begin
   i:=(val and mask);
   Result:=(i=0) or (i=mask);
+ end;
+
+ procedure sum2(var ror,rsl:TsrRegNode); inline;
+ begin
+  if (ror=nil) then
+  begin
+   ror:=rsl;
+  end else
+  begin
+   ror:=OpLogicalOrTo(ror,rsl);
+  end;
  end;
 
 begin
@@ -626,33 +816,29 @@ begin
   begin
    ror:=NewImm_b(True);
   end else
-  if _test_group(val,fcNaN     ) or
-     _test_group(val,fcInfinity) or
-     _test_group(val,fcNegative) or
-     _test_group(val,fcPositive) then
+  if test_group(val,fcNaN     ) and
+     test_group(val,fcInfinity) and
+     (
+      (test_group(val,fcNegative) and
+       test_group(val,fcPositive)
+      ) or
+      test_group(val,fcFinite)
+     ) then
   begin
    ror:=nil;
 
    if (val and fcNaN)=fcNaN then
    begin
-    rsl:=NewReg(dtBool);
-    _Op1(line,Op.OpIsNan,rsl,src0);
-    ror:=rsl;
+    rsl:=OpIsNanTo(src0);
+    //
+    sum2(ror,rsl);
    end;
 
    if (val and fcInfinity)=fcInfinity then
    begin
-    rsl:=NewReg(dtBool);
-    _Op1(line,Op.OpIsInf,rsl,src0);
+    rsl:=OpIsInfTo(src0);
     //
-    if (ror=nil) then
-    begin
-     ror:=rsl;
-    end else
-    begin
-     ror:=OpLogicalOrTo(ror,rsl);
-    end;
-    //
+    sum2(ror,rsl);
    end;
 
    if (val and fcNegative)=fcNegative then
@@ -660,14 +846,7 @@ begin
     rsl:=NewReg(dtBool);
     _Op2(line,Op.OpFOrdLessThanEqual,rsl,src0,NewImm_s(dtFloat32,-0.0));
     //
-    if (ror=nil) then
-    begin
-     ror:=rsl;
-    end else
-    begin
-     ror:=OpLogicalOrTo(ror,rsl);
-    end;
-    //
+    sum2(ror,rsl);
    end;
 
    if (val and fcPositive)=fcPositive then
@@ -675,14 +854,15 @@ begin
     rsl:=NewReg(dtBool);
     _Op2(line,Op.OpFOrdGreaterThanEqual,rsl,src0,NewImm_s(dtFloat32,+0.0));
     //
-    if (ror=nil) then
-    begin
-     ror:=rsl;
-    end else
-    begin
-     ror:=OpLogicalOrTo(ror,rsl);
-    end;
+    sum2(ror,rsl);
+   end;
+
+   if (val and fcFinite)=fcFinite then
+   begin
+    //(!isNan(src) && !isInf(src)) -> !(isNan(src) || isInf(src))
+    rsl:=OpNotTo(OpLogicalOrTo(OpIsNanTo(src0),OpIsInfTo(src0)));
     //
+    sum2(ror,rsl);
    end;
 
    if (ror=nil) then
@@ -903,7 +1083,7 @@ begin
  pLayout:=DataLayoutList.pRoot;
  lvl_0.offset:=offset_dw*4;
  lvl_0.size  :=4;
- pChain:=pLayout.Fetch(@lvl_0,nil);
+ pChain:=pLayout.Fetch(line.Parent,@lvl_0,nil);
  pReg:=FetchLoad(pChain,dtUnknow);
  MakeCopy(dst,pReg);
 end;
@@ -912,7 +1092,7 @@ function TEmitFetch.FetchChain(grp:TsrDataLayout;lvl_0:PsrChainLvl_0;lvl_1:PsrCh
 var
  pChain:TsrChain;
 begin
- pChain:=grp.Fetch(lvl_0,lvl_1,cflags);
+ pChain:=grp.Fetch(line.Parent,lvl_0,lvl_1,cflags);
  Result:=FetchLoad(pChain,dtUnknow);
 end;
 
@@ -921,7 +1101,7 @@ var
  pChain:TsrChain;
  pReg:TsrRegNode;
 begin
- pChain:=grp.Fetch(lvl_0,lvl_1,cflags);
+ pChain:=grp.Fetch(line.Parent,lvl_0,lvl_1,cflags);
  pReg:=FetchLoad(pChain,dtUnknow);
  MakeCopy(pSlot,pReg);
  Result:=pSlot^.current;

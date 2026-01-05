@@ -71,7 +71,6 @@ type
  end;
 
 function  EnumLineRegs(cb:TRegsCb;pLine:TspirvOp):Integer;
-function  EnumFirstReg(cb:TRegsCb;pLine:TspirvOp):Integer;
 function  EnumBlockOpForward(cb:TPostCb;pBlock:TsrOpBlock):Integer;
 function  EnumBlockOpBackward(cb:TPostCb;pBlock:TsrOpBlock):Integer;
 
@@ -110,21 +109,26 @@ begin
  end;
 end;
 
-function EnumFirstReg(cb:TRegsCb;pLine:TspirvOp):Integer;
+
+function EnumRegs(cb:TRegsCb;pLine:TspirvOp;ids:array of Integer):Integer;
 var
+ i:Integer;
  node:POpParamNode;
  pReg:TsrRegNode;
 begin
  Result:=0;
  if (cb=nil) or (pLine=nil) then Exit;
- node:=pLine.ParamFirst;
- if (node<>nil) then
+ For i:=0 to High(ids) do
  begin
-  if node.Value.IsType(ntReg) then
+  node:=pLine.ParamNode(ids[i]);
+  if (node<>nil) then
   begin
-   pReg:=node.AsReg;
-   Result:=Result+cb(pLine,pReg);
-   node.Value:=pReg;
+   if node.Value.IsType(ntReg) then
+   begin
+    pReg:=node.AsReg;
+    Result:=Result+cb(pLine,pReg);
+    node.Value:=pReg;
+   end;
   end;
  end;
 end;
@@ -177,6 +181,13 @@ var
 begin
  Result:=0;
  if (node=nil) then Exit;
+
+ if (node.dsbgr) then Exit;
+
+ if (pLine.OpId=Op.OpGroupNonUniformBallot) then
+ begin
+  Exit;
+ end;
 
  old:=node;
  src:=RegDown(node);
@@ -571,14 +582,16 @@ begin
  if not node.pDst.IsType(ntReg) then Exit; //is reg
 
  Case node.OpId of
-  Op.OpBitFieldSExtract  ,
-  Op.OpBitFieldUExtract  :Result:=EnumFirstReg(@RegSTStrict,node);
-  Op.OpSelect            :Result:=EnumLineRegs(@RegSTStrict,node);
-  Op.OpIAddCarry         ,
-  Op.OpISubBorrow        ,
-  Op.OpUMulExtended      ,
-  Op.OpSMulExtended      ,
-  Op.OpCompositeConstruct:Result:=EnumLineRegs(@RegVTStrict,node);
+  Op.OpBitFieldInsert          :Result:=EnumRegs(@RegSTStrict,node,[0,1]);
+  Op.OpBitFieldSExtract        ,
+  Op.OpBitFieldUExtract        :Result:=EnumRegs(@RegSTStrict,node,[0]);
+  Op.OpGroupNonUniformBroadcast:Result:=EnumRegs(@RegSTStrict,node,[1]);
+  Op.OpSelect                  :Result:=EnumLineRegs(@RegSTStrict,node);
+  Op.OpIAddCarry               ,
+  Op.OpISubBorrow              ,
+  Op.OpUMulExtended            ,
+  Op.OpSMulExtended            ,
+  Op.OpCompositeConstruct      :Result:=EnumLineRegs(@RegVTStrict,node);
   else;
  end;
 
@@ -738,7 +751,7 @@ begin
   Op.OpGroupNonUniformShuffle:
     begin
      //upgrade version to 1.3
-     Config.UpgradeVersion($10300);
+     Config.UpgradeVersion13;
      AddCapability(Capability.GroupNonUniformShuffle);
     end;
   Op.OpGroupNonUniformQuadBroadcast:
@@ -749,14 +762,50 @@ begin
      if r.is_const then
      begin
       //upgrade version to 1.3
-      Config.UpgradeVersion($10300);
+      Config.UpgradeVersion13;
      end else
      begin
       //upgrade version to 1.5
-      Config.UpgradeVersion($10500);
+      Config.UpgradeVersion15;
      end;
      //
      AddCapability(Capability.GroupNonUniformQuad);
+    end;
+  Op.OpGroupNonUniformBroadcast:
+    begin
+     r:=node.ParamNode(2).Value;
+     r:=RegDown(r);
+     //
+     if r.is_const then
+     begin
+      //upgrade version to 1.3
+      Config.UpgradeVersion13;
+     end else
+     begin
+      //upgrade version to 1.5
+      Config.UpgradeVersion15;
+     end;
+     //
+     AddCapability(Capability.GroupNonUniformBallot);
+    end;
+  Op.OpGroupNonUniformBallot,
+  Op.OpGroupNonUniformBallotBitCount:
+    begin
+     //upgrade version to 1.3
+     Config.UpgradeVersion13;
+     AddCapability(Capability.GroupNonUniformBallot);
+    end;
+  Op.OpAtomicFMinEXT,
+  Op.OpAtomicFMaxEXT:
+    begin
+     case node.pType.dtype.BitSize of
+      16:AddCapability(Capability.AtomicFloat16MinMaxEXT);
+      32:AddCapability(Capability.AtomicFloat32MinMaxEXT);
+      64:AddCapability(Capability.AtomicFloat64MinMaxEXT);
+      else;
+     end;
+     //
+     HeaderList.SPV_EXT_shader_atomic_float_min_max;
     end;
   else;
  end;

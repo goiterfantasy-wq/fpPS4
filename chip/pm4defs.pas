@@ -791,10 +791,29 @@ type
   drawInitiator:TVGT_DRAW_INITIATOR;
  end;
 
+ PPM4CMDDRAWINDEXINDIRECT=^TPM4CMDDRAWINDEXINDIRECT;
+ TPM4CMDDRAWINDEXINDIRECT=bitpacked record
+  header             :PM4_TYPE_3_HEADER;
+  dataOffset         :DWORD; // < [31:2] DWORD aligned offset
+  baseVtxLoc         :WORD;  // < base vertex location
+  reserved1          :WORD;
+  startInstLoc       :WORD;  // < start instance location
+  reserved2          :WORD;
+  drawInitiator      :TVGT_DRAW_INITIATOR;
+ end;
+
+ TDrawIndexedIndirectArgs=packed record
+  indexCount   :DWORD; // < Number of vertices to draw.
+  instanceCount:DWORD; // < Number of instances to draw.
+  firstIndex   :DWORD; // < Starting index buffer slot for the draw.
+  vertexOffset :DWORD; // < Offset added to the index fetched from the index buffer before it is passed to the vertex shader.
+  firstInstance:DWORD; // < Starting instance for the draw.  Instace IDs passed to the vertex shader will range from firstInstance to firstInstance + instanceCount - 1.
+ end;
+
  PPM4CMDDRAWINDEXINDIRECTMULTI=^TPM4CMDDRAWINDEXINDIRECTMULTI;
  TPM4CMDDRAWINDEXINDIRECTMULTI=bitpacked record
   header             :PM4_TYPE_3_HEADER;
-  dataOffset         :DWORD; // < DWORD aligned offset
+  dataOffset         :DWORD; // < [31:2] DWORD aligned offset
   baseVtxLoc         :WORD;  // < base vertex location
   reserved1          :WORD;
   startInstLoc       :WORD;  // < start instance location
@@ -804,11 +823,14 @@ type
   countIndirectEnable:bit1;  // < Indicates the data structure count is in memory
   drawIndexEnable    :bit1;  // < Enables writing of Draw Index count to DRAW_INDEX_LOC
   count              :DWORD; // < Count of data structures to loop through before going to next packet
-  countAddrLo        :DWORD; // < Lower bits of DWord aligned Address[31:2]; Valid if countIndirectEnable is set
-  countAddrHi        :DWORD; // < Upper bits of Address[63:32]; Valid if countIndirectEnable is set
+  countAddr          :QWORD; // < Lower bits of DWord aligned Address[31:2]; Valid if countIndirectEnable is set
+                             // < Upper bits of Address[63:32]; Valid if countIndirectEnable is set
   stride             :DWORD; // < Stride in memory from one data structure to the next
   drawInitiator      :TVGT_DRAW_INITIATOR;
  end;
+
+ PPM4CMDDRAWINDEXINDIRECTCOUNTMULTI=^TPM4CMDDRAWINDEXINDIRECTCOUNTMULTI;
+ TPM4CMDDRAWINDEXINDIRECTCOUNTMULTI=TPM4CMDDRAWINDEXINDIRECTMULTI;
 
  PPM4CMDDISPATCHDIRECT=^TPM4CMDDISPATCHDIRECT;
  TPM4CMDDISPATCHDIRECT=packed record

@@ -11,6 +11,8 @@ uses
 
   bittype,
 
+  tiling_avx,
+
   si_ci_vi_merged_offset,
   si_ci_vi_merged_enum,
   si_ci_vi_merged_registers
@@ -340,12 +342,15 @@ type
   m_minGpuMode     :DWORD;
   m_tileMode       :DWORD;
   m_arrayMode      :DWORD;
+  //
   m_linearWidth    :DWORD;
   m_linearHeight   :DWORD;
   m_linearDepth    :DWORD;
+  //
   m_paddedWidth    :DWORD;
   m_paddedHeight   :DWORD;
   m_paddedDepth    :DWORD;
+  //
   m_bitsPerElement :DWORD;
   m_bytePerElement :DWORD;
   m_linearSizeBytes:DWORD;
@@ -357,12 +362,16 @@ type
   m_tilesPerRow    :DWORD;
   m_tilesPerSlice  :DWORD;
 
-  m_isBlockCompressed:DWORD;
+  m_isBlockCompressed:Boolean;
+  m_isPow2Pad        :Boolean;
 
   m_element_table  :p_element_table_xyz;
 
-  procedure init_surface(bytePerElement,isBlockCompressed,tile_idx,tile_alt:DWORD);
-  procedure init_size_2d(width,height:DWORD);
+  m_copy_tile2linear:t_copy_cbs;
+  m_copy_linear2tile:t_copy_cbs;
+
+  procedure init_surface(bytePerElement,tile_idx,tile_alt:DWORD;isBlockCompressed,isPow2Pad:Boolean);
+  procedure init_size(width,pitch,height,depth:DWORD);
   function  getTiledElementByteOffset(var outTiledByteOffset:QWORD;x,y,z:DWORD):integer;
   function  getTiledElementBitOffset (var outTiledBitOffset :QWORD;x,y,z:DWORD):integer;
  end;
@@ -2029,14 +2038,62 @@ begin
  Result:=sce_Gnm_DataFormat_build(INFO.FORMAT,INFO.NUMBER_TYPE,INFO.COMP_SWAP);
 end;
 
+function isMicroTiled(tileMode:Byte):Boolean; inline;
+begin
+ case tileMode of
+  kTileModeDepth_1dThin,
+  kTileModeDisplay_1dThin,
+  kTileModeThin_1dThin,
+  kTileModeThick_1dThick:
+    Result:=True;
+   else
+    Result:=False;
+ end;
+end;
+
 function isMacroTiled(tileMode:Byte):Boolean; inline;
 begin
- Result:=($7f7dcdf shr (tileMode and $3f) and 1)<>0;
+ case tileMode of
+  kTileModeDepth_2dThin_64,
+  kTileModeDepth_2dThin_128,
+  kTileModeDepth_2dThin_256,
+  kTileModeDepth_2dThin_512,
+  kTileModeDepth_2dThin_1K,
+  kTileModeDepth_2dThinPrt_256,
+  kTileModeDepth_2dThinPrt_1K,
+  kTileModeDisplay_2dThin,
+  kTileModeDisplay_ThinPrt,
+  kTileModeDisplay_2dThinPrt,
+  kTileModeThin_2dThin,
+  kTileModeThin_3dThin,
+  kTileModeThin_ThinPrt,
+  kTileModeThin_2dThinPrt,
+  kTileModeThin_3dThinPrt,
+  kTileModeThick_2dThick,
+  kTileModeThick_3dThick,
+  kTileModeThick_ThickPrt,
+  kTileModeThick_2dThickPrt,
+  kTileModeThick_3dThickPrt,
+  kTileModeThick_2dXThick,
+  kTileModeThick_3dXThick:
+    Result:=True;
+   else
+    Result:=False;
+ end;
 end;
 
 function isPartiallyResidentTexture(arrayMode:Byte):Boolean; inline;
 begin
- Result:=($8e60 shr (arrayMode and $3f) and 1)<>0;
+ case arrayMode of
+  kArrayModeTiledThinPrt,
+  kArrayMode2dTiledThinPrt,
+  kArrayMode2dTiledThickPrt,
+  kArrayMode3dTiledThinPrt,
+  kArrayMode3dTiledThickPrt:
+    Result:=True;
+   else
+    Result:=False;
+ end;
 end;
 
 function isPowerOfTwo(x:DWORD):Boolean;
@@ -2094,7 +2151,7 @@ var
  arrayMode:Byte;
 begin
  Result:=-$7f2d0000;
- if (outMacroTileMode <> nil) then Exit;
+ if (outMacroTileMode = nil) then Exit;
 
  if (numFragmentsPerPixel > 8) or (not isPowerOfTwo(numFragmentsPerPixel)) then Exit;
 
@@ -2103,7 +2160,7 @@ begin
 
  Result := -$7f2d0000;
 
- if (bitsPerElement < 1) or (bitsPerElement > 128) or (not isMacroTiled(arrayMode)) then Exit;
+ if (bitsPerElement < 1) or (bitsPerElement > 128) or (not isMacroTiled(tileMode)) then Exit;
 
  if (numFragmentsPerPixel < 1) or (numFragmentsPerPixel > 16) or (not isPowerOfTwo(numFragmentsPerPixel)) then Exit;
 
@@ -2141,6 +2198,7 @@ begin
  else
   outMacroTileMode^:=mtmIndex;
 
+ Result:=0;
 end;
 
 function getPipeCount(pipeConfig:Byte):DWORD; forward;
@@ -2158,17 +2216,19 @@ procedure computeCmaskInfo(outCmaskSizeBytes:PPtruint;
                            GpuMode          :Byte;
                            Height           :Word
                           );
+const
+ bitsPerElement=4;
 var
  pipeConfig     :DWORD;
  numPipes       :DWORD;
  cmask_is_linear:Boolean;
- res1           :DWORD;
- res2           :DWORD;
- prev           :DWORD;
- next           :DWORD;
+ macroWidth     :DWORD;
+ macroHeight    :DWORD;
+ w,h,ph         :DWORD;
  CmaskPitch     :DWORD;
  CmaskAlign     :DWORD;
- size           :Ptruint;
+ CmaskHeight    :DWORD;
+ slice          :Ptruint;
 begin
  PipeConfig:=0;
 
@@ -2192,43 +2252,43 @@ begin
   cmask_is_linear:=(INFO.CMASK_ADDR_TYPE=CMASK_ADDR_COMPATIBLE);
  end;
 
- res1:=64;
- res2:=64;
-
- if (not cmask_is_linear) then
+ if (cmask_is_linear) then
  begin
-  next:=1;
-  res1:=256;
+  macroWidth :=8*kMicroTileWidth;
+  macroHeight:=8*kMicroTileHeight;
+ end else
+ begin
+  h:=1;
+  w:=kCmaskCacheBits div bitsPerElement;
 
   repeat
-   res2:=res1;
-   prev:=next;
-   next:=next*2;
-   if (res2<=(next * numPipes)) then break;
-   res1:=res2 shr 1;
-  until ((res2 and 1) <> 0);
+   ph:=h;
+   h :=h*2;
+   if (w<=(h*numPipes)) then break;
+   w:=w div 2;
+  until ((w and 1)<>0);
 
-  res2:=res2 * 8;
-  res1:=prev * numPipes * 8;
+  macroWidth :=8*w;
+  macroHeight:=8*ph*numPipes;
  end;
 
- Assert(isPowerOfTwo(res1));
- Assert(isPowerOfTwo(res2));
+ Assert(isPowerOfTwo(macroHeight));
+ Assert(isPowerOfTwo(macroWidth));
 
- CmaskPitch:=(-res2) and (PITCH.TILE_MAX*8+7) + res2;
- CmaskAlign:=numPipes shl 8;
+ CmaskPitch :=((PITCH.TILE_MAX*8+8)+macroWidth -1) and (-macroWidth );
+ CmaskHeight:=(Height              +macroHeight-1) and (-macroHeight);
+ CmaskAlign :=kPipeInterleaveBytes*numPipes;
 
- res2:=(-res1) and (Height - 1) + res1;
-
- repeat
-  size:=res2;
-  res2:=res2 + res1;
-  size:=size * (CmaskPitch shr 7);
- until ((size mod CmaskAlign) = 0);
+ slice:=(CmaskHeight*CmaskPitch) shr 7;
+ while ((slice mod CmaskAlign)<>0) do
+ begin
+  CmaskHeight:=CmaskHeight+macroHeight;
+  slice:=(CmaskHeight*CmaskPitch) shr 7;
+ end;
 
  if (outCmaskSizeBytes<>nil) then
  begin
-  outCmaskSizeBytes^:=size * (VIEW.SLICE_MAX + 1);
+  outCmaskSizeBytes^:=slice*(VIEW.SLICE_MAX+1);
  end;
 
  if (outCmaskAlign<>nil) then
@@ -2243,7 +2303,7 @@ begin
 
  if (outCmaskHeight<>nil) then
  begin
-  outCmaskHeight^:=res2 - res1;
+  outCmaskHeight^:=CmaskHeight;
  end;
 
 end;
@@ -2474,6 +2534,7 @@ begin
          sVar1:=3;
        end;
        Result := ((((1 shl ((_NumBanks + 1) and $1f)) -1) shl sVar1) and BASE) shr 4;
+       //Result = (~(-1 << (_NumBanks + 1U & 0x1f)) << sVar5 & base) >> 4;
        Exit;
      end;
    end;
@@ -2750,21 +2811,21 @@ begin
         end;
       32:
         begin
-   elem:=elem or ( (x shr 0) and $1 ) shl 0;
-   elem:=elem or ( (x shr 1) and $1 ) shl 1;
-   elem:=elem or ( (y shr 0) and $1 ) shl 2;
-   elem:=elem or ( (x shr 2) and $1 ) shl 3;
-   elem:=elem or ( (y shr 1) and $1 ) shl 4;
-   elem:=elem or ( (y shr 2) and $1 ) shl 5;
+         elem:=elem or ( (x shr 0) and $1 ) shl 0;
+         elem:=elem or ( (x shr 1) and $1 ) shl 1;
+         elem:=elem or ( (y shr 0) and $1 ) shl 2;
+         elem:=elem or ( (x shr 2) and $1 ) shl 3;
+         elem:=elem or ( (y shr 1) and $1 ) shl 4;
+         elem:=elem or ( (y shr 2) and $1 ) shl 5;
         end;
       64:
         begin
-   elem:=elem or ( (x shr 0) and $1 ) shl 0;
-   elem:=elem or ( (y shr 0) and $1 ) shl 1;
-   elem:=elem or ( (x shr 1) and $1 ) shl 2;
-   elem:=elem or ( (x shr 2) and $1 ) shl 3;
-   elem:=elem or ( (y shr 1) and $1 ) shl 4;
-   elem:=elem or ( (y shr 2) and $1 ) shl 5;
+         elem:=elem or ( (x shr 0) and $1 ) shl 0;
+         elem:=elem or ( (y shr 0) and $1 ) shl 1;
+         elem:=elem or ( (x shr 1) and $1 ) shl 2;
+         elem:=elem or ( (x shr 2) and $1 ) shl 3;
+         elem:=elem or ( (y shr 1) and $1 ) shl 4;
+         elem:=elem or ( (y shr 2) and $1 ) shl 5;
         end;
       else;
        //Assert(false,'Unsupported bitsPerElement (%u) for displayable surface.');
@@ -2804,7 +2865,7 @@ begin
        kArrayMode2dTiledXThick,
        kArrayMode3dTiledXThick:
          begin
-   elem:=elem or ( (z shr 2) and $1 ) shl 8;
+          elem:=elem or ( (z shr 2) and $1 ) shl 8;
          end;
        kArrayMode1dTiledThick,
        kArrayMode2dTiledThick,
@@ -2815,36 +2876,36 @@ begin
         case bitsPerElement of
          8,16:
            begin
-         elem:=elem or ( (x shr 0) and $1 ) shl 0;
-         elem:=elem or ( (y shr 0) and $1 ) shl 1;
-         elem:=elem or ( (x shr 1) and $1 ) shl 2;
-         elem:=elem or ( (y shr 1) and $1 ) shl 3;
-         elem:=elem or ( (z shr 0) and $1 ) shl 4;
-         elem:=elem or ( (z shr 1) and $1 ) shl 5;
-         elem:=elem or ( (x shr 2) and $1 ) shl 6;
-         elem:=elem or ( (y shr 2) and $1 ) shl 7;
+            elem:=elem or ( (x shr 0) and $1 ) shl 0;
+            elem:=elem or ( (y shr 0) and $1 ) shl 1;
+            elem:=elem or ( (x shr 1) and $1 ) shl 2;
+            elem:=elem or ( (y shr 1) and $1 ) shl 3;
+            elem:=elem or ( (z shr 0) and $1 ) shl 4;
+            elem:=elem or ( (z shr 1) and $1 ) shl 5;
+            elem:=elem or ( (x shr 2) and $1 ) shl 6;
+            elem:=elem or ( (y shr 2) and $1 ) shl 7;
            end;
          32:
            begin
-         elem:=elem or ( (x shr 0) and $1 ) shl 0;
-         elem:=elem or ( (y shr 0) and $1 ) shl 1;
-         elem:=elem or ( (x shr 1) and $1 ) shl 2;
-         elem:=elem or ( (z shr 0) and $1 ) shl 3;
-         elem:=elem or ( (y shr 1) and $1 ) shl 4;
-         elem:=elem or ( (z shr 1) and $1 ) shl 5;
-         elem:=elem or ( (x shr 2) and $1 ) shl 6;
-         elem:=elem or ( (y shr 2) and $1 ) shl 7;
+            elem:=elem or ( (x shr 0) and $1 ) shl 0;
+            elem:=elem or ( (y shr 0) and $1 ) shl 1;
+            elem:=elem or ( (x shr 1) and $1 ) shl 2;
+            elem:=elem or ( (z shr 0) and $1 ) shl 3;
+            elem:=elem or ( (y shr 1) and $1 ) shl 4;
+            elem:=elem or ( (z shr 1) and $1 ) shl 5;
+            elem:=elem or ( (x shr 2) and $1 ) shl 6;
+            elem:=elem or ( (y shr 2) and $1 ) shl 7;
            end;
          64,128:
            begin
-         elem:=elem or ( (x shr 0) and $1 ) shl 0;
-         elem:=elem or ( (y shr 0) and $1 ) shl 1;
-         elem:=elem or ( (z shr 0) and $1 ) shl 2;
-         elem:=elem or ( (x shr 1) and $1 ) shl 3;
-         elem:=elem or ( (y shr 1) and $1 ) shl 4;
-         elem:=elem or ( (z shr 1) and $1 ) shl 5;
-         elem:=elem or ( (x shr 2) and $1 ) shl 6;
-         elem:=elem or ( (y shr 2) and $1 ) shl 7;
+            elem:=elem or ( (x shr 0) and $1 ) shl 0;
+            elem:=elem or ( (y shr 0) and $1 ) shl 1;
+            elem:=elem or ( (z shr 0) and $1 ) shl 2;
+            elem:=elem or ( (x shr 1) and $1 ) shl 3;
+            elem:=elem or ( (y shr 1) and $1 ) shl 4;
+            elem:=elem or ( (z shr 1) and $1 ) shl 5;
+            elem:=elem or ( (x shr 2) and $1 ) shl 6;
+            elem:=elem or ( (y shr 2) and $1 ) shl 7;
            end;
           else;
            //Assert(false,'Invalid bitsPerElement (%u) for microTileMode=kMicroTileModeThick.');
@@ -2980,7 +3041,7 @@ begin
  Result:=bank;
 end;
 
-procedure Tiler1d.init_surface(bytePerElement,isBlockCompressed,tile_idx,tile_alt:DWORD);
+procedure Tiler1d.init_surface(bytePerElement,tile_idx,tile_alt:DWORD;isBlockCompressed,isPow2Pad:Boolean);
 begin
  m_minGpuMode    :=tile_alt;
  m_tileMode      :=tile_idx;
@@ -2999,32 +3060,77 @@ begin
  m_tileBytes     := kMicroTileWidth * kMicroTileHeight * m_tileThickness * m_bytePerElement;
 
  m_isBlockCompressed := isBlockCompressed;
+ m_isPow2Pad         := isPow2Pad;
 
  m_element_table :=getElementTableXYZ(m_bitsPerElement,m_microTileMode,m_arrayMode);
+
+ case tile_idx of
+  kTileModeDisplay_1dThin:
+   begin
+    m_copy_tile2linear:=copy_array_tile2linear_Display1d[fastIntLog2(bytePerElement)];
+    m_copy_linear2tile:=copy_array_linear2tile_Display1d[fastIntLog2(bytePerElement)];
+   end;
+  kTileModeThick_1dThick:
+   begin
+    m_copy_tile2linear:=copy_array_tile2linear_Thick1d[fastIntLog2(bytePerElement)];
+    m_copy_linear2tile:=copy_array_linear2tile_Thick1d[fastIntLog2(bytePerElement)];
+   end;
+  else
+   begin
+    m_copy_tile2linear:=copy_array_tile2linear_Thin1d[fastIntLog2(bytePerElement)];
+    m_copy_linear2tile:=copy_array_linear2tile_Thin1d[fastIntLog2(bytePerElement)];
+   end;
+ end;
+
 end;
 
-procedure Tiler1d.init_size_2d(width,height:DWORD);
+function nextPowerOfTwo(x:Ptruint):Ptruint; inline;
+begin
+ x:=(x-1);
+ x:=x or (x shr 1);
+ x:=x or (x shr 2);
+ x:=x or (x shr 4);
+ x:=x or (x shr 8);
+ x:=x or (x shr 16);
+ x:=x or (x shr 32);
+ Result:=(x+1);
+end;
+
+procedure Tiler1d.init_size(width,pitch,height,depth:DWORD);
 var
  log_sz:QWORD;
 begin
- m_paddedDepth :=1;
+ if (m_isBlockCompressed) then
+ begin
+  width :=(width +3) shr 2;
+  pitch :=(pitch +3) shr 2;
+  height:=(height+3) shr 2;
+ end;
 
  m_linearWidth :=width;
  m_linearHeight:=height;
- m_linearDepth :=1;
+ m_linearDepth :=depth;
 
- if (m_isBlockCompressed<>0) then
+ m_paddedWidth :=pitch;
+ m_paddedHeight:=height;
+ m_paddedDepth :=depth;
+
+ if (m_isPow2Pad) then
  begin
-  m_linearWidth :=(m_linearWidth +3) shr 2;
-  m_linearHeight:=(m_linearHeight+3) shr 2;
+  m_paddedWidth :=nextPowerOfTwo(m_paddedWidth);
+  m_paddedHeight:=nextPowerOfTwo(m_paddedHeight);
+  m_paddedDepth :=nextPowerOfTwo(m_paddedDepth);
  end;
 
  //microtile align
- m_paddedWidth :=(m_linearWidth +7) and (not 7);
- m_paddedHeight:=(m_linearHeight+7) and (not 7);
+ m_paddedWidth :=max((m_paddedWidth +7) and (not 7),8);
+ m_paddedHeight:=max((m_paddedHeight+7) and (not 7),8);
+ m_paddedDepth :=max(Align(m_paddedDepth,m_tileThickness),m_tileThickness);
 
- //for 1d textures
- m_paddedHeight:=max(m_paddedHeight,8);
+ //update to detiling pad (AVX)
+ m_linearWidth :=max((m_linearWidth +7) and (not 7),8);
+ m_linearHeight:=max((m_linearHeight+7) and (not 7),8);
+ m_linearDepth :=max(Align(m_linearDepth,m_tileThickness),m_tileThickness);
 
  //align pitch to pipe_interleave_size
  log_sz:=(m_paddedWidth*m_paddedHeight*m_bytePerElement*m_tileThickness);
@@ -3054,7 +3160,6 @@ begin
 
  m_tilesPerRow    :=m_paddedWidth div kMicroTileWidth;
  m_tilesPerSlice  :=m_tilesPerRow * (m_paddedHeight div kMicroTileHeight);
-
 end;
 
 function Tiler1d.getTiledElementBitOffset(var outTiledBitOffset:QWORD;x,y,z:DWORD):integer;

@@ -23,9 +23,16 @@ const
  SCE_REGMGR_ENT_KEY_DEVENV_TOOL_disable_sce_module_ver_chk = $78020B00;
  SCE_REGMGR_ENT_KEY_DEVENV_TOOL_game_heap_trace            = $7802B700;
  SCE_REGMGR_ENT_KEY_DEVENV_TOOL_expose_under_2k            = $7802B900;
+ SCE_REGMGR_ENT_KEY_DEVENV_TOOL_COMMONDIALOG_watch_dog     = $7802CD01;
+
+ //[libSceVrTracker]
+ // UNKNOW: sceRegMgrNonSysGetBin 0x34F16C7A440358DA->key:0x20034001
 
 function sys_regmgr_call(op,key:DWORD;presult,pvalue:Pointer;vlen:QWORD):Integer;
 function sys_workaround8849(key:DWORD):Integer;
+
+var
+ intmem_peak_size:Integer=0;
 
 implementation
 
@@ -123,7 +130,7 @@ begin
   SCE_REGMGR_ENT_KEY_DEVENV_TOOL_expose_under_2k           :p_out^:=0; //sceVideoOutOpen  debug video modes?
   SCE_REGMGR_ENT_KEY_VIDEOOUT_enable_supersampling_mode    :p_out^:=0; //sceVideoOutOpen
 
-  SCE_REGMGR_ENT_KEY_SYSTEM_LIBC_intmem_peak_size          :p_out^:=0; //libSceLibcInternal
+  SCE_REGMGR_ENT_KEY_SYSTEM_LIBC_intmem_peak_size          :p_out^:=intmem_peak_size; //libSceLibcInternal
   SCE_REGMGR_ENT_KEY_SYSTEM_LIBC_intmem_shortage_count     :p_out^:=0; //libSceLibcInternal
 
   SCE_REGMGR_ENT_KEY_NP_debug                              :p_out^:=0; //sys_workaround8849, libSceSysUtil
@@ -131,6 +138,22 @@ begin
   SCE_REGMGR_ENT_KEY_DEVENV_TOOL_trc_notify                :p_out^:=0; //sys_workaround8849
   SCE_REGMGR_ENT_KEY_DEVENV_TOOL_sys_prx_preload           :p_out^:=0; //sys_workaround8849
   SCE_REGMGR_ENT_KEY_DEVENV_TOOL_use_default_lib           :p_out^:=0; //sys_workaround8849
+
+  SCE_REGMGR_ENT_KEY_DEVENV_TOOL_COMMONDIALOG_watch_dog    :p_out^:=0; //sceCommonDialog
+
+  else
+   Exit(-1);
+ end;
+
+end;
+
+function sceRegMgrSetInt(key:DWORD;val:Integer):Integer;
+begin
+ Result:=0;
+
+ case key of
+
+  SCE_REGMGR_ENT_KEY_SYSTEM_LIBC_intmem_peak_size: intmem_peak_size:=val;
 
   else
    Exit(-1);
@@ -165,7 +188,31 @@ begin
 
  case op of
 
-  $18: Assert(false,'Unhandled regmgr op:sceRegMgrNonSysSetInt');
+  $18: //sceRegMgrNonSysSetInt
+      begin
+       Result:=copyin(pvalue,@data,16);
+       if (Result<>0) then
+       begin
+        kret:=$800d020f;
+        goto _err;
+       end;
+
+       skey:=regMgrCnvRegId(data.enc1,data.enc2);
+
+       if (skey<0) then
+       begin
+        kret:=skey;
+        goto _err;
+       end;
+
+       Result:=sceRegMgrSetInt(skey,data.int_val);
+       if (Result<>0) then
+       begin
+        print_error_td('[sceRegMgrNonSysSetInt] enc:0x'+HexStr(data.enc1,16)+'->key:0x'+HexStr(skey,8));
+        Assert(False);
+       end;
+
+      end;
 
   $19: //sceRegMgrNonSysGetInt
       begin
@@ -187,7 +234,7 @@ begin
        Result:=sceRegMgrGetInt(skey,@data.int_val);
        if (Result<>0) then
        begin
-        print_error_td(' enc:0x'+HexStr(data.enc1,16)+'->key:0x'+HexStr(skey,8));
+        print_error_td('[sceRegMgrNonSysGetInt] enc:0x'+HexStr(data.enc1,16)+'->key:0x'+HexStr(skey,8));
         Assert(False);
        end;
 
@@ -224,7 +271,7 @@ begin
           end;
         else
          begin
-          print_error_td(' enc:0x'+HexStr(data.enc1,16)+'->key:0x'+HexStr(skey,8));
+          print_error_td('[sceRegMgrNonSysGetStr] enc:0x'+HexStr(data.enc1,16)+'->key:0x'+HexStr(skey,8));
           Assert(False);
          end;
        end;
@@ -255,7 +302,7 @@ begin
 
         else
          begin
-          print_error_td(' enc:0x'+HexStr(data.enc1,16)+'->key:0x'+HexStr(skey,8));
+          print_error_td('[sceRegMgrNonSysGetBin] enc:0x'+HexStr(data.enc1,16)+'->key:0x'+HexStr(skey,8));
           Assert(False);
          end;
        end;

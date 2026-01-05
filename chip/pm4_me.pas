@@ -1827,6 +1827,7 @@ begin
  GPU_REGS.SG_REG:=@ctx.rt_info^.SHADERDATA.SG_REG;
  GPU_REGS.CX_REG:=@CX_REG;
  GPU_REGS.UC_REG:=@ctx.rt_info^.SHADERDATA.UC_REG;
+ GPU_REGS.SDP   :=@ctx.rt_info^.ShaderDrawParams;
 
  CX_REG:=Default(TCONTEXT_REG_GROUP);
 
@@ -2478,22 +2479,80 @@ begin
  case node^.ntype of
   ntDrawIndex2:
    begin
-    Writeln(node^.id,':DrawIndexOffset2(',node^.indexOffset,',',node^.vertexOffset,',',node^.indexCount,')');
-    ctx.Cmd.DrawIndexOffset2(Pointer(node^.indexBase),node^.indexOffset,node^.vertexOffset,node^.indexCount);
+    Writeln(node^.id,':DrawIndexOffset2(',HexStr(Pointer(node^.indexBase)),',',
+                                          node^.indexOffset ,',',
+                                          node^.vertexOffset,',',
+                                          node^.indexCount  ,')');
+
+    ctx.Cmd.DrawIndexOffset2(Pointer(node^.indexBase),
+                             node^.indexOffset,
+                             node^.vertexOffset,
+                             node^.indexCount);
    end;
   ntDrawIndexOffset2:
    begin
-    Writeln(node^.id,':DrawIndexOffset2(',node^.indexOffset,',',node^.vertexOffset,',',node^.indexCount,')');
-    ctx.Cmd.DrawIndexOffset2(Pointer(node^.indexBase),node^.indexOffset,node^.vertexOffset,node^.indexCount);
+    Writeln(node^.id,':DrawIndexOffset2(',HexStr(Pointer(node^.indexBase)),',',
+                                          node^.indexOffset ,',',
+                                          node^.vertexOffset,',',
+                                          node^.indexCount  ,')');
+
+    ctx.Cmd.DrawIndexOffset2(Pointer(node^.indexBase),
+                             node^.indexOffset,
+                             node^.vertexOffset,
+                             node^.indexCount);
    end;
   ntDrawIndexAuto:
    begin
-    Writeln(node^.id,':DrawIndexAuto(',node^.vertexOffset,',',node^.indexCount,')');
-    ctx.Cmd.DrawIndexAuto(node^.vertexOffset,node^.indexCount);
+    Writeln(node^.id,':DrawIndexAuto(',node^.vertexOffset,',',
+                                       node^.indexCount  ,')');
+
+    ctx.Cmd.DrawIndexAuto(node^.vertexOffset,
+                          node^.indexCount);
    end;
   ntClearDepth:
    begin
     pm4_ClearDepth(node^.rt_info,ctx);
+   end;
+
+  ntDrawIndexIndirect:
+   begin
+    Writeln(node^.id,':DrawIndexIndirect(',HexStr(Pointer(node^.indirectBase)),',',
+                                           node^.dataOffset,')');
+
+    ctx.Cmd.DrawIndexIndirect(
+     Pointer(node^.indexBase),
+     node^.indexOffset,
+     node^.vertexOffset,
+     node^.indexCount,
+     //
+     Pointer(node^.indirectBase),
+     nil,
+     node^.dataOffset,
+     sizeof(TVkDrawIndexedIndirectCommand),
+     1
+    );
+   end;
+
+  ntDrawIndexIndirectCountMulti:
+   begin
+    Writeln(node^.id,':DrawIndexIndirectCountMulti(',HexStr(Pointer(node^.indirectBase)),',',
+                                                     HexStr(Pointer(node^.countAddr   )),',',
+                                                     node^.dataOffset,',',
+                                                     node^.stride    ,',',
+                                                     node^.count     ,')');
+
+    ctx.Cmd.DrawIndexIndirect(
+     Pointer(node^.indexBase),
+     node^.indexOffset,
+     node^.vertexOffset,
+     node^.indexCount,
+     //
+     Pointer(node^.indirectBase),
+     Pointer(node^.countAddr),
+     node^.dataOffset,
+     node^.stride,
+     node^.count
+    );
    end;
   else;
    Assert(false,'pm4_Draw');
@@ -2623,6 +2682,56 @@ begin
 
 end;
 
+function Detect_buf_meta(var ctx:t_me_render_context;
+                         var UniformBuilder:TvUniformBuilder):Boolean;
+var
+ i:Integer;
+
+ buffer:p_pm4_resource;
+
+ ht:TvMetaHtile;
+ hc:TvMetaCmask;
+begin
+ Result:=False;
+
+ //buffers
+ if (Length(UniformBuilder.FBuffers)<>0) then
+ begin
+  For i:=0 to High(UniformBuilder.FBuffers) do
+  With UniformBuilder.FBuffers[i] do
+  begin
+
+   //get buffer with write usege
+   if ((memuse and TM_WRITE)<>0) then
+   begin
+
+    buffer:=ctx.stream^.find_buffer_resource(R_BUF,addr,size);
+
+    if (buffer<>nil) then
+    begin
+
+     ht:=FetchHtile(ctx.Cmd,buffer^.rkey,size);
+     if (ht<>nil) then
+     begin
+      Exit(True);
+     end;
+
+     hc:=FetchCmask(ctx.Cmd,buffer^.rkey,size);
+     if (hc<>nil) then
+     begin
+      Exit(True);
+     end;
+
+    end;
+
+   end;
+
+  end;
+ end;
+ //buffers
+
+end;
+
 procedure Prepare_buf_clear(var ctx:t_me_render_context;
                             var UniformBuilder:TvUniformBuilder);
 var
@@ -2728,6 +2837,14 @@ begin
  //htile/cmask/rt heuristic
  if (CP_KEY.FShaderGroup.FKey.FShaders[vShaderStageCs].IsCSClearShader) then
  begin
+  Prepare_buf_clear(ctx,FUniformBuilder);
+  //
+  ctx.InsertLabel('clear htile/cmask/rt');
+ end else
+ if Detect_buf_meta(ctx,FUniformBuilder) then
+ begin
+  Writeln('Detect_buf_meta:0x',HexStr(CP_KEY.FShaderGroup.FKey.FShaders[vShaderStageCs].FHash_gcn,16));
+  //
   Prepare_buf_clear(ctx,FUniformBuilder);
   //
   ctx.InsertLabel('clear htile/cmask/rt');
@@ -3687,6 +3804,8 @@ begin
       ntHint               :pm4_Hint               (ctx,Pointer(ctx.node));
       ntDrawIndex2         :pm4_Draw               (ctx,Pointer(ctx.node));
       ntDrawIndexOffset2   :pm4_Draw               (ctx,Pointer(ctx.node));
+      ntDrawIndexIndirect  :pm4_Draw               (ctx,Pointer(ctx.node));
+      ntDrawIndexIndirectCountMulti:pm4_Draw       (ctx,Pointer(ctx.node));
       ntDrawIndexAuto      :pm4_Draw               (ctx,Pointer(ctx.node));
       ntClearDepth         :pm4_Draw               (ctx,Pointer(ctx.node));
       ntResolve            :pm4_Resolve            (ctx,Pointer(ctx.node));

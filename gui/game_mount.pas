@@ -43,8 +43,6 @@ implementation
 uses
  md_map,
  sysutils,
- fileutil,
- LazFileUtils,
  strings,
  errno,
  kern_proc,
@@ -69,7 +67,7 @@ end;
 Constructor TGameMountConfig.Create;
 begin
  LocalDir:='';
- TitleId :='?????????'#0;
+ TitleId :='?????????';
  //
  mtx_init(mount_mtx,'mount_mtx');
 end;
@@ -146,7 +144,7 @@ const
  MM_LAST    =2;
 
 type
- t_mnt_flags=Set of (mfReadOnly,mfIgnoreErr,mfForceDir,mfPFS);
+ t_mnt_flags=Set of (mfReadOnly,mfIgnoreErr,mfForceDir,mfPFS,mfBudget);
 
 type
  pp_mount_dir=^p_mount_dir;
@@ -245,7 +243,7 @@ const
  );
 
  SANDBOX_DIRS:array[0..7] of t_mount_dir=(
-  (dst:'/app0'       ;src:'%s'                 ;mode:MM_GAME  ;flags:[mfReadOnly,mfPFS]),
+  (dst:'/app0'       ;src:'%s'                 ;mode:MM_GAME  ;flags:[mfReadOnly,mfPFS,mfBudget]),
   (dst:'/av_contents';src:'%s/user/av_contents';mode:MM_LOCAL ;flags:[mfForceDir]),
   (dst:'/data'       ;src:'%s/user/data'       ;mode:MM_LOCAL ;flags:[mfForceDir]),
   (dst:'/host'       ;src:''                   ;mode:MM_CREATE;flags:[mfReadOnly]),
@@ -275,9 +273,9 @@ begin
  GameMountConfig:=TGameMountConfig.Create;
  GameMountConfig.LocalDir:=GameStartupInfo.LocalDir;
 
- if (GameStartupInfo.TITLE<>'') then
+ if (GameStartupInfo.TITLE_ID<>'') then
  begin
-  GameMountConfig.TitleId:=GameStartupInfo.TITLE;
+  GameMountConfig.TitleId:=GameStartupInfo.TITLE_ID;
  end else
  if (GameStartupInfo.FGameItem.GameInfo.TitleId<>'') then
  begin
@@ -289,7 +287,7 @@ begin
  //save to global
 
  //temp hack
- err:=mount_into_sandbox('ufs','/savedata0','savedata',nil,0,True);
+ err:=mount_into_sandbox('ufs','/savedata0','savedata',nil,MNT_BIG_APP,True);
 
  fs_source[MM_GAME    ]:=ExcludeTrailingPathDelimiter(GameStartupInfo.FGameItem.FMountList.game    );
  fs_source[MM_FIRMWARE]:=ExcludeTrailingPathDelimiter(GameStartupInfo.FGameItem.FMountList.firmware);
@@ -320,8 +318,9 @@ begin
                             pchar(fs_dst),
                             pchar(fs_src),
                             nil,
-                            ord(mfReadOnly in flags)*MNT_RDONLY or
-                            ord(mfPFS      in flags)*MNT_EMU_PFS,
+                            ord(mfReadOnly in flags)*MNT_RDONLY  or
+                            ord(mfPFS      in flags)*MNT_EMU_PFS or
+                            ord(mfBudget   in flags)*MNT_BIG_APP,
                             mfIgnoreErr in flags);
    end;
 
@@ -341,7 +340,7 @@ begin
                           DOWNLOAD_DIRS[i],
                           pchar(fs_src),
                           nil,
-                          0,
+                          MNT_BIG_APP,
                           False);
  end;
  //download
@@ -402,6 +401,16 @@ begin
  FileClose(F);
 end;
 
+const
+  //Don't follow symlinks on *nix, just delete them
+  FindMask = faAnyFile {$ifdef unix} or faSymLink{%H-} {$endif unix};
+
+  {$IFDEF WINDOWS}
+  GetAllFilesMask='*.*';
+  {$ELSE}
+  GetAllFilesMask='*';
+  {$ENDIF}
+
 function DeleteDirectory(const DirectoryName: RawByteString; OnlyChildren: boolean): boolean;
 type
  PNode=^TNode;
@@ -445,9 +454,6 @@ var
   end;
  end;
 
-const
-  //Don't follow symlinks on *nix, just delete them
-  DeleteMask = faAnyFile {$ifdef unix} or faSymLink{%H-} {$endif unix};
 var
   FileInfo: TSearchRec;
   CurSrcDir: RawByteString;
@@ -456,10 +462,10 @@ label
   _next;
 begin
   Result:=false;
-  CurSrcDir:=CleanAndExpandDirectory(DirectoryName);
+  CurSrcDir:=IncludeTrailingPathDelimiter(DirectoryName);
   stack:=nil;
 _next:
-  if SysUtils.FindFirst(CurSrcDir+GetAllFilesMask,DeleteMask,FileInfo)=0 then
+  if SysUtils.FindFirst(CurSrcDir+GetAllFilesMask,FindMask,FileInfo)=0 then
   begin
    repeat
      // check if special file
@@ -472,7 +478,7 @@ _next:
         {$ifdef unix} and ((FileInfo.Attr and faSymLink{%H-})=0) {$endif unix} then
      begin
        Push(CurSrcDir,OnlyChildren);
-       CurSrcDir:=CleanAndExpandDirectory(CurFilename);
+       CurSrcDir:=IncludeTrailingPathDelimiter(CurFilename);
        OnlyChildren:=False;
        SysUtils.FindClose(FileInfo);
        goto _next;
@@ -503,13 +509,12 @@ type
  TNode=record
   N:PNode;
   S:RawByteString;
-  F:TSearchRec;
  end;
 
 var
  stack:PNode;
 
- procedure Push(const S:RawByteString;const F:TSearchRec);
+ procedure Push(const S:RawByteString);
  var
   new:PNode;
  begin
@@ -517,11 +522,10 @@ var
   Initialize(new^);
   new^.N:=stack;
   new^.S:=S;
-  new^.F:=F;
   stack:=new;
  end;
 
- Function Pop(var S:RawByteString;var F:TSearchRec):Boolean;
+ Function Pop(var S:RawByteString):Boolean;
  var
   old:PNode;
  begin
@@ -530,7 +534,6 @@ var
    old:=stack;
    stack:=old^.N;
    S:=old^.S;
-   F:=old^.F;
    Finalize(old^);
    FreeMem(old);
    Result:=True;
@@ -549,9 +552,6 @@ var
   Result:=tmp-(tmp mod alignment);
  end;
 
-const
-  //Don't follow symlinks on *nix, just delete them
-  FindMask = faAnyFile {$ifdef unix} or faSymLink{%H-} {$endif unix};
 var
   files_size :Int64;
   inode_count:Int64;
@@ -566,16 +566,15 @@ const
   c_inode_size =168;
   c_inodes_per_block=c_block_size div c_inode_size;
 label
-  _down,
   _next;
 begin
   Result:=0;
   files_size :=0;
   inode_count:=0;
   dirent_size:=0;
-  CurSrcDir:=CleanAndExpandDirectory(DirectoryName);
+  CurSrcDir:=IncludeTrailingPathDelimiter(DirectoryName);
   stack:=nil;
- _down:
+ _next:
   if SysUtils.FindFirst(CurSrcDir+GetAllFilesMask,FindMask,FileInfo)=0 then
   begin
    repeat
@@ -585,28 +584,24 @@ begin
        continue;
      end;
      //
-     CurFilename:=CurSrcDir+FileInfo.Name;
-     //
      inode_count:=inode_count+1;
      dirent_size:=dirent_size+AlignUp(c_dirent_size+Length(FileInfo.Name)+1,8);
      //
      if ((FileInfo.Attr and faDirectory)>0)
         {$ifdef unix} and ((FileInfo.Attr and faSymLink{%H-})=0) {$endif unix} then
      begin
-       Push(CurSrcDir,FileInfo);
-       CurSrcDir:=CleanAndExpandDirectory(CurFilename);
-       goto _down;
+       CurFilename:=CurSrcDir+FileInfo.Name;
+       CurFilename:=IncludeTrailingPathDelimiter(CurFilename);
+       Push(CurFilename);
      end else
      begin
        files_size:=files_size+AlignUp(FileInfo.Size,c_block_size);
      end;
-     //
-     _next:
    until SysUtils.FindNext(FileInfo)<>0;
    SysUtils.FindClose(FileInfo);
   end;
 
-  if Pop(CurSrcDir,FileInfo) then
+  if Pop(CurSrcDir) then
   begin
    goto _next;
   end;

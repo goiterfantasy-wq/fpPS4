@@ -8,6 +8,7 @@ interface
 uses
  vmparam,
  subr_dynlib,
+ kern_proc,
  np_error,
  ps4_libSceUserService;
 
@@ -632,6 +633,7 @@ var
 
  ps4_sceKernelCloseEventFlag :function(ef:SceKernelEventFlag):Integer;
  ps4_sceKernelDeleteEventFlag:function(ef:SceKernelEventFlag):Integer;
+ ps4_sceKernelSetEventFlag   :function(ef:SceKernelEventFlag;bitPattern:QWORD):Integer;
 
 function ps4_sceNpCreateEventFlag(ef:pSceKernelEventFlag;
                                   pName:PChar;
@@ -652,6 +654,100 @@ end;
 function ps4_sceNpDeleteEventFlag(ef:SceKernelEventFlag):Integer;
 begin
  Result:=ps4_sceKernelDeleteEventFlag(ef);
+ Result:=(Result shr $1F) and Result;
+end;
+
+function ps4_sceNpSetEventFlag(ef:SceKernelEventFlag;bitPattern:QWORD):Integer;
+begin
+ Result:=ps4_sceKernelSetEventFlag(ef,bitPattern);
+ Result:=(Result shr $1F) and Result;
+end;
+
+//
+
+type
+ p_pthread_attr_t=^pthread_attr_t;
+ pthread_attr_t  =Pointer;
+
+ p_pthread_t=^pthread_t;
+ pthread_t  =Pointer;
+
+var
+ ps4_scePthreadAttrInit           :function(pAttr:p_pthread_attr_t):Integer;
+ ps4_scePthreadAttrDestroy        :function(pAttr:p_pthread_attr_t):Integer;
+ ps4_scePthreadAttrSetstacksize   :function(pAttr:p_pthread_attr_t;size:QWORD):Integer;
+ ps4_scePthreadAttrSetaffinity    :function(pAttr:p_pthread_attr_t;mask:QWORD):Integer;
+ ps4_scePthreadAttrSetinheritsched:function(pAttr:p_pthread_attr_t;sched_inherit:Integer):Integer;
+ ps4_scePthreadAttrSetschedpolicy :function(pAttr:p_pthread_attr_t;policy:Integer):Integer;
+ ps4_scePthreadAttrSetschedparam  :function(pAttr:p_pthread_attr_t;param:PInteger):Integer;
+ ps4_scePthreadCreate             :function(pthread:p_pthread_t;
+                                            pAttr  :p_pthread_attr_t;
+                                            entry  :Pointer;
+                                            arg    :Pointer;
+                                            name   :Pchar):Integer;
+ ps4_scePthreadJoin               :function(pthread:pthread_t;value_ptr:PPointer):Integer;
+
+
+function ps4_sceNpCreateThread(pthread  :p_pthread_t;
+                               entry    :Pointer;
+                               arg      :Pointer;
+                               spolicy  :Integer;
+                               stackSize:QWORD;
+                               mask     :QWORD;
+                               name     :Pchar):Integer;
+label
+ _exit,
+ _free;
+var
+ ga:TGUEST_STACK;
+ p_attr  :p_pthread_attr_t;
+ p_policy:PInteger;
+begin
+ ga:=prolog;
+
+ p_attr:=ga.alloca(SizeOf(Pointer));
+ p_attr^:=nil;
+
+ p_policy:=ga.alloca(SizeOf(Integer));
+
+ Result:=ps4_scePthreadAttrInit(p_attr);
+ if (Result < 0) then goto _exit;
+
+ Result:=ps4_scePthreadAttrSetstacksize(p_attr,stackSize);
+ if (Result < 0) then goto _free;
+
+ if (spolicy <> 0) then
+ begin
+  if (p_proc.p_sdk_version >= $2500000) then
+  begin
+   Result:=ps4_scePthreadAttrSetinheritsched(p_attr,0);
+   if (Result < 0) then goto _free;
+   Result:=ps4_scePthreadAttrSetschedpolicy (p_attr,1);
+   if (Result < 0) then goto _free;
+
+   p_policy^:=spolicy;
+   Result:=ps4_scePthreadAttrSetschedparam(p_attr,p_policy);
+   if (Result < 0) then goto _free;
+  end;
+ end;
+
+ if (mask <> 0) then
+ begin
+  Result:=ps4_scePthreadAttrSetaffinity(p_attr,mask);
+  if (Result < 0) then goto _free;
+ end;
+
+ Result:=ps4_scePthreadCreate(pthread,p_attr,entry,arg,name);
+
+ _free:
+  ps4_scePthreadAttrDestroy(p_attr);
+ _exit:
+  ga.epilog;
+end;
+
+function ps4_sceNpJoinThread(pthread:pthread_t;value_ptr:PPointer):Integer;
+begin
+ Result:=ps4_scePthreadJoin(pthread,value_ptr);
  Result:=(Result shr $1F) and Result;
 end;
 
@@ -760,6 +856,17 @@ begin
  end;
 end;
 
+//sce::np::EventFlag::Set(unsigned long)
+function ps4__ZN3sce2np9EventFlag3SetEm(this:p_EventFlag;param_1:QWORD):Integer;
+begin
+ if (this^.evtype=0) then
+ begin
+  Assert(False,'IsInit()');
+ end;
+
+ Result:=ps4_sceNpSetEventFlag(this^.evf,param_1);
+end;
+
 //
 
 //sce::np::Mutex::Mutex(Mutex *this)
@@ -840,11 +947,16 @@ begin
  lib.set_proc($EA3156A407EA01C7,@ps4_sceNpCreateEventFlag);
  lib.set_proc($FA79A7F99D27583A,@ps4_sceNpCloseEventFlag);
  lib.set_proc($B239C87850AE4C3D,@ps4_sceNpDeleteEventFlag);
+ lib.set_proc($DBD7ED38622B502A,@ps4_sceNpSetEventFlag);
+ //
+ lib.set_proc($7E1279B8ACDC9F4C,@ps4_sceNpCreateThread);
+ lib.set_proc($12332C7CEDC60880,@ps4_sceNpJoinThread);
  //
  lib.set_proc($D2CC8D921240355C,@ps4__ZN3sce2np6ObjectnwEmR14SceNpAllocator);
  //
  lib.set_proc($70C3A0904D8CD9EF,@ps4__ZN3sce2np9EventFlagC1Ev);
  lib.set_proc($6A6162FC0BF5F615,@ps4__ZN3sce2np9EventFlag6CreateEPKcj);
+ lib.set_proc($F22FEF395455B79C,@ps4__ZN3sce2np9EventFlag3SetEm);
  //
  lib.set_proc($3B502F950537DE92,@ps4__ZN3sce2np5MutexC1Ev);
  lib.set_proc($69334E97D101E15E,@ps4__ZN3sce2np5Mutex4InitEPKcj);
@@ -868,6 +980,7 @@ begin
  lib.set_proc($0691686E8509A195,@ps4_sceKernelCreateEventFlag);
  lib.set_proc($B3DFD16B1BA4BB34,@ps4_sceKernelCloseEventFlag);
  lib.set_proc($F26AA5F4E7109DDE,@ps4_sceKernelDeleteEventFlag);
+ lib.set_proc($20E9D2BC7CEABBA0,@ps4_sceKernelSetEventFlag);
 
  lib.set_proc($98BF0D0C7F3A8902,@ps4_sceKernelMapNamedFlexibleMemory);
 
@@ -880,6 +993,16 @@ begin
  lib.set_proc($F542B5BCB6507EDE,@ps4_scePthreadMutexLock);
  lib.set_proc($B67DD5943D211BAD,@ps4_scePthreadMutexUnlock);
  lib.set_proc($BA9A15AF330715E1,@ps4_scePthreadMutexTrylock);
+
+ lib.set_proc($9EC628351CB0C0D8,@ps4_scePthreadAttrInit           );
+ lib.set_proc($EB6282C04326CDC3,@ps4_scePthreadAttrDestroy        );
+ lib.set_proc($5135F325B5A18531,@ps4_scePthreadAttrSetstacksize   );
+ lib.set_proc($DEAC603387B31130,@ps4_scePthreadAttrSetaffinity    );
+ lib.set_proc($7976D44A911A4EC0,@ps4_scePthreadAttrSetinheritsched);
+ lib.set_proc($E3E87D133C0A1782,@ps4_scePthreadAttrSetschedpolicy );
+ lib.set_proc($0F3112F61405E1FE,@ps4_scePthreadAttrSetschedparam  );
+ lib.set_proc($E9482DC15FB4CDBE,@ps4_scePthreadCreate             );
+ lib.set_proc($A27358F41CA7FD6F,@ps4_scePthreadJoin               );
 
  module:=Result^.add_mod('libSceLibcInternal',1);
  lib:=module.add_lib('libSceLibcInternal');

@@ -30,6 +30,8 @@ type
    Procedure FLazy; static;
  end;
 
+procedure hazard_init;
+
 implementation
 
 uses
@@ -39,7 +41,8 @@ uses
  g_node_splay,
  kern_thr,
  time,
- md_sleep;
+ md_sleep,
+ kern_daemon;
 
 var
  rlist_bs:LIST_HEAD=(lh_first:nil);
@@ -116,17 +119,20 @@ begin
  while (ttd<>nil) do
  begin
 
-  For i:=0 to High(kthread.td_guards) do
+  if (ttd<>curkthread) then
   begin
-   p_data:=load_acq_rel(ttd^.td_guards[i]);
-
-   if (p_data=P) then
+   For i:=0 to High(kthread.td_guards) do
    begin
-    threads_unlock;
-    msleep_td(hz div 10000);
-    goto _again;
-   end;
+    p_data:=load_acq_rel(ttd^.td_guards[i]);
 
+    if (p_data=P) then
+    begin
+     threads_unlock;
+     msleep_td(hz div 10000);
+     goto _again;
+    end;
+
+   end;
   end;
 
   ttd:=TAILQ_NEXT(ttd,@ttd^.td_plist)
@@ -364,7 +370,20 @@ begin
  Scan(smLazy);
 end;
 
+Procedure Guard_Lazy; SysV_ABI_CDecl;
+begin
+ Scan(smLazy);
+end;
+
 /////////
+
+var
+ stub:t_daemon_node;
+
+procedure hazard_init;
+begin
+ sys_daemon_add_cbs(@stub,@Guard_Lazy);
+end;
 
 end.
 

@@ -284,7 +284,11 @@ var
   VK_EXT_provoking_vertex                :Boolean;
   VK_KHR_image_format_list               :Boolean;
   VK_EXT_descriptor_indexing             :Boolean;
+  VK_KHR_draw_indirect_count             :Boolean;
+  VK_KHR_shader_draw_parameters          :Boolean;
 
+  VK_EXT_shader_atomic_float             :Boolean;
+  VK_EXT_shader_atomic_float2            :Boolean;
   VK_KHR_shader_float16_int8             :Boolean;
   VK_KHR_16bit_storage                   :Boolean;
   VK_KHR_8bit_storage                    :Boolean;
@@ -331,6 +335,9 @@ var
   nullDescriptor     :TVkBool32;
 
   DescriptorIndexingFeatures:TVkPhysicalDeviceDescriptorIndexingFeatures;
+
+  ShaderAtomicFloatFeatures :TVkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
+  ShaderAtomicFloat2Features:TVkPhysicalDeviceShaderAtomicFloat2FeaturesEXT;
 
   maxUniformBufferRange:TVkUInt32;
   maxStorageBufferRange:TVkUInt32;
@@ -499,7 +506,11 @@ begin
     VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME                :limits.VK_EXT_provoking_vertex                :=True;
     VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME               :limits.VK_KHR_image_format_list               :=True;
     VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME             :limits.VK_EXT_descriptor_indexing             :=True;
+    VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME             :limits.VK_KHR_draw_indirect_count             :=True;
+    VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME          :limits.VK_KHR_shader_draw_parameters          :=True;
 
+    VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME             :limits.VK_EXT_shader_atomic_float             :=True;
+    VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME           :limits.VK_EXT_shader_atomic_float2            :=True;
     VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME             :limits.VK_KHR_shader_float16_int8             :=True;
     VK_KHR_16BIT_STORAGE_EXTENSION_NAME                   :limits.VK_KHR_16bit_storage                   :=True;
     VK_KHR_8BIT_STORAGE_EXTENSION_NAME                    :limits.VK_KHR_8bit_storage                    :=True;
@@ -1021,6 +1032,8 @@ var
  FWMEL     :TVkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR;
  FRF       :TVkPhysicalDeviceRobustness2FeaturesEXT;
  FDI       :TVkPhysicalDeviceDescriptorIndexingFeatures;
+ FSAF      :TVkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
+ FSAF2     :TVkPhysicalDeviceShaderAtomicFloat2FeaturesEXT;
  r:TVkResult;
 begin
  vkApp:=GetVkApplicationInfo;
@@ -1090,6 +1103,8 @@ begin
  FWMEL:=Default(TVkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR);
  FRF  :=Default(TVkPhysicalDeviceRobustness2FeaturesEXT);
  FDI  :=Default(TVkPhysicalDeviceDescriptorIndexingFeatures);
+ FSAF :=Default(TVkPhysicalDeviceShaderAtomicFloatFeaturesEXT);
+ FSAF2:=Default(TVkPhysicalDeviceShaderAtomicFloat2FeaturesEXT);
 
  if (vkGetPhysicalDeviceFeatures2<>nil) then
  begin
@@ -1117,6 +1132,13 @@ begin
   FRF.pNext:=@FDI;
 
   FDI.sType:=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+  FDI.pNext:=@FSAF;
+
+  FSAF.sType:=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+  FSAF.pNext:=@FSAF2;
+
+  FSAF2.sType:=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT;
+  FSAF.pNext :=nil;
 
   vkGetPhysicalDeviceFeatures2(FPhysicalDevice,@Features2);
 
@@ -1151,6 +1173,12 @@ begin
 
  FDI.pNext:=nil;
  limits.DescriptorIndexingFeatures              :=FDI;
+
+ FSAF.pNext:=nil;
+ limits.ShaderAtomicFloatFeatures               :=FSAF;
+
+ FSAF2.pNext:=nil;
+ limits.ShaderAtomicFloat2Features              :=FSAF2;
 
  LoadFamily;
 end;
@@ -1960,6 +1988,9 @@ var
  FSF16:TVkPhysicalDevice16BitStorageFeatures;
  FRF  :TVkPhysicalDeviceRobustness2FeaturesEXT;
  FDI  :TVkPhysicalDeviceDescriptorIndexingFeatures;
+ FSAF :TVkPhysicalDeviceShaderAtomicFloatFeaturesEXT;
+ FSAF2:TVkPhysicalDeviceShaderAtomicFloat2FeaturesEXT;
+ FSDP :TVkPhysicalDeviceShaderDrawParametersFeatures;
  FIVML:TVkPhysicalDeviceImageViewMinLodFeaturesEXT;
  FDCC :TVkPhysicalDeviceDepthClipControlFeaturesEXT;
  FDCE :TVkPhysicalDeviceDepthClipEnableFeaturesEXT;
@@ -2107,6 +2138,22 @@ begin
   DeviceInfo.add_feature(@FDI);
  end;
 
+ if limits.VK_KHR_draw_indirect_count then
+ begin
+  DeviceInfo.add_ext(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
+ end;
+
+ if limits.VK_KHR_shader_draw_parameters then
+ begin
+  DeviceInfo.add_ext(VK_KHR_SHADER_DRAW_PARAMETERS_EXTENSION_NAME);
+
+  FSDP:=Default(TVkPhysicalDeviceShaderDrawParametersFeatures);
+  FSDP.sType:=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
+  FSDP.shaderDrawParameters:=VK_TRUE;
+
+  DeviceInfo.add_feature(@FSDP);
+ end;
+
  //if limits.VK_KHR_push_descriptor then
  //begin
  // DeviceQueues.add_ext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
@@ -2141,6 +2188,26 @@ begin
   FWorkgroupLayout.workgroupMemoryExplicitLayout16BitAccess      :=limits.workgroupMemoryExplicitLayout16BitAccess;
 
   DeviceInfo.add_feature(@FWorkgroupLayout);
+ end;
+
+ if limits.VK_EXT_shader_atomic_float then
+ begin
+  DeviceInfo.add_ext(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+
+  FSAF:=limits.ShaderAtomicFloatFeatures;
+  FSAF.sType:=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+
+  DeviceInfo.add_feature(@FSAF);
+ end;
+
+ if limits.VK_EXT_shader_atomic_float2 then
+ begin
+  DeviceInfo.add_ext(VK_EXT_SHADER_ATOMIC_FLOAT_2_EXTENSION_NAME);
+
+  FSAF2:=limits.ShaderAtomicFloat2Features;
+  FSAF2.sType:=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_2_FEATURES_EXT;
+
+  DeviceInfo.add_feature(@FSAF2);
  end;
 
  if limits.VK_KHR_shader_float16_int8 then

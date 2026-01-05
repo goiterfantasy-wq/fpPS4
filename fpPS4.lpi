@@ -29,6 +29,11 @@
             <OtherUnitFiles Value="gui;rtl;sys;sys\dev;sys\fs;sys\jit;sys\kern;sys\md;sys\vfs;sys\vm;sys\fs\deadfs;sys\fs\devfs;sys\fs\fdescfs;sys\fs\nullfs;sys\fs\ufs;sys\test;kernel\libthr;vulkan;chip;shaders;spirv;src;src\np;src\audio;src\param_sfo;src\playgo;src\ajm"/>
             <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
           </SearchPaths>
+          <Parsing>
+            <SyntaxOptions>
+              <IncludeAssertionCode Value="True"/>
+            </SyntaxOptions>
+          </Parsing>
           <CodeGeneration>
             <SmartLinkUnit Value="True"/>
             <RelocatableUnit Value="True"/>
@@ -49,11 +54,12 @@
             </Options>
           </Linking>
           <Other>
+            <CustomOptions Value="-CpCOREAVX"/>
             <OtherDefines Count="1">
               <Define0 Value="DEBUG_MTX"/>
             </OtherDefines>
             <ExecuteAfter>
-              <Command Value="$(ProjPath)\tools\fp_rebase\fp_rebase$(ExeExt) &quot;$(OutputFile)&quot; -rebase 0xB0000000000 -dwarf"/>
+              <Command Value="$(ProjPath)\tools\fp_rebase\fp_rebase$(ExeExt) &quot;$(OutputFile)&quot; -rebase 0x7FF000000000 -dwarf"/>
               <ShowAllMessages Value="True"/>
             </ExecuteAfter>
           </Other>
@@ -707,10 +713,6 @@
       </Unit>
       <Unit>
         <Filename Value="sys\vm\rmem_map.pas"/>
-        <IsPartOfProject Value="True"/>
-      </Unit>
-      <Unit>
-        <Filename Value="sys\vm\sys_vm_object.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
       <Unit>
@@ -1659,6 +1661,81 @@
         <Filename Value="sys\jit\kern_lazy_jit.pas"/>
         <IsPartOfProject Value="True"/>
       </Unit>
+      <Unit>
+        <Filename Value="sys\vm\vm_blockpool.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\vm\kern_vm_object.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="src\ps4_libscehmd.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="ps4_libSceHmd"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\dev\dev_camera.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="src\ps4_libscevrtracker.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="ps4_libSceVrTracker"/>
+      </Unit>
+      <Unit>
+        <Filename Value="src\audio\ps4_libsceaudio3d.pas"/>
+        <IsPartOfProject Value="True"/>
+        <UnitName Value="ps4_libSceAudio3d"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\jit\kern_jit_interrupt.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\vfs\vfs_aio.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\vfs\vfs_aio2.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="rtl\SDL3_main.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="src\audio\SDL3_audio_interface.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="rtl\SDL3.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="rtl\SDL3_audio.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\vm\uma.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\vm\uma_core.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\kern\kern_daemon.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="sys\kern\kern_hamt.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
+      <Unit>
+        <Filename Value="chip\pm4_context.pas"/>
+        <IsPartOfProject Value="True"/>
+      </Unit>
     </Units>
   </ProjectOptions>
   <CompilerOptions>
@@ -1694,11 +1771,12 @@
       </Options>
     </Linking>
     <Other>
+      <CustomOptions Value="-CpCOREAVX"/>
       <OtherDefines Count="1">
         <Define0 Value="DEBUG_MTX"/>
       </OtherDefines>
       <ExecuteAfter>
-        <Command Value="$(ProjPath)\tools\fp_rebase\fp_rebase$(ExeExt) &quot;$(OutputFile)&quot; -rebase 0xB0000000000 -dwarf"/>
+        <Command Value="$(ProjPath)\tools\fp_rebase\fp_rebase$(ExeExt) &quot;$(OutputFile)&quot; -rebase 0x7FF000000000 -dwarf"/>
         <ShowAllMessages Value="True"/>
       </ExecuteAfter>
     </Other>

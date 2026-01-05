@@ -15,7 +15,7 @@ uses
  signalvar,
  time,
  rtprio,
- hamt;
+ kern_hamt;
 
 procedure thread_reap();
 
@@ -60,6 +60,9 @@ procedure kthread_exit();
 
 procedure thread_suspend_all(exclude:p_kthread);
 procedure thread_resume_all (exclude:p_kthread);
+
+var
+ thread_suspend_source:p_kthread=nil;
 
 var
  init_tty_cb:Tprocedure;
@@ -323,17 +326,17 @@ end;
 
 procedure threads_lock; public;
 begin
- rw_wlock(tidhash_lock);
+ rw_rlock(tidhash_lock);
 end;
 
 function threads_trylock:Boolean; public;
 begin
- Result:=rw_try_wlock(tidhash_lock);
+ Result:=rw_try_rlock(tidhash_lock);
 end;
 
 procedure threads_unlock; public;
 begin
- rw_wunlock(tidhash_lock);
+ rw_runlock(tidhash_lock);
 end;
 
 
@@ -885,6 +888,7 @@ var
  td,ttd:p_kthread;
 begin
  td:=curkthread;
+ thread_suspend_source:=td;
 
  threads_lock;
 
@@ -908,6 +912,7 @@ var
  td,ttd:p_kthread;
 begin
  td:=curkthread;
+ thread_suspend_source:=nil;
 
  threads_lock;
 
@@ -956,6 +961,7 @@ begin
      while (ttd<>nil) do
      begin
 
+      if ((ttd^.td_pflags and TDP_KTHREAD)=0) then //not system
       if (ttd<>td) then
       begin
        Result:=0;
@@ -963,7 +969,7 @@ begin
        tdksignal(ttd,sig,@ksi);
       end;
 
-
+      //
       ttd:=TAILQ_NEXT(ttd,@ttd^.td_plist)
      end;
 

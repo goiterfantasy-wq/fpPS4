@@ -9,26 +9,16 @@ uses
  sysutils,
  vm,
  vm_map,
- sys_vm_object;
+ vm_object;
 
-type
- p_query_memory_prot=^t_query_memory_prot;
- t_query_memory_prot=packed record
-  start:Pointer;
-  __end:Pointer;
-  prot  :Integer;
-  eflags:Integer;
- end;
- {$IF sizeof(t_query_memory_prot)<>24}{$STOP sizeof(t_query_memory_prot)<>24}{$ENDIF}
+function sys_mlock(addr:Pointer;len:QWORD):Integer;
 
- function sys_mlock(addr:Pointer;len:QWORD):Integer;
-
- function sys_mmap(vaddr:Pointer;
-                   vlen :QWORD;
-                   prot :Integer;
-                   flags:Integer;
-                   fd   :Integer;
-                   pos  :QWORD):Pointer;
+function sys_mmap(vaddr:Pointer;
+                  vlen :QWORD;
+                  prot :Integer;
+                  flags:Integer;
+                  fd   :Integer;
+                  pos  :QWORD):Pointer;
 
 function sys_munmap(addr:Pointer;len:QWORD):Integer;
 function sys_msync(addr:Pointer;len:QWORD;flags:Integer):Integer;
@@ -36,7 +26,6 @@ function sys_mprotect(addr:Pointer;len:QWORD;prot:Integer):Integer;
 function sys_mtypeprotect(addr:Pointer;len:QWORD;mtype,prot:Integer):Integer;
 function sys_madvise(addr:Pointer;len:QWORD;behav:Integer):Integer;
 function sys_mname(addr:Pointer;len:QWORD;name:PChar):Integer;
-function sys_query_memory_protection(addr:Pointer;info:Pointer):Integer;
 
 function sys_batch_map(fd                :Integer;
                        flags             :DWORD;
@@ -144,14 +133,15 @@ begin
  begin
   dev_relthread(cdev, ref);
   maxprotp^:=$33;
-  flagsp^:=flagsp^ or MAP_ANON;
+  flags    :=flags or MAP_ANON;
+  flagsp^  :=flags;
   Exit(0);
  end;
  {
   * cdevs do not provide private mappings of any kind.
   }
- if ((maxprotp^ and VM_PROT_WRITE)=0) and
-    ((prot and VM_PROT_WRITE)<>0) then
+ if ((maxprotp^ and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))=0) and
+    ((prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))<>0) then
  begin
   dev_relthread(cdev, ref);
   Exit(EACCES);
@@ -183,6 +173,9 @@ begin
 
  if (error<>ENODEV) then
  begin
+  //PS4 and FreeBSD do not update the flag here
+  //Is this a bug? Who knows?
+  flagsp^:=flags;
   Exit(error);
  end;
 
@@ -193,12 +186,12 @@ begin
   Exit(EINVAL);
  end;
 
- objp^:=obj;
+ objp^  :=obj;
  flagsp^:=flags;
  Exit(0);
 end;
 
-function vm_mmap_vnode(objsize     :vm_size_t;
+function vm_mmap_vnode(size        :vm_size_t;
                        prot        :vm_prot_t;
                        maxprotp    :p_vm_prot_t;
                        flagsp      :PInteger;
@@ -210,26 +203,31 @@ label
  mark_atime,
  done;
 var
- va:t_vattr;
- obj:vm_object_t;
- foff:vm_offset_t;
- mp:p_mount;
+ va     :t_vattr;
+ obj    :vm_object_t;
+ foff   :vm_offset_t;
+ objsize:vm_size_t;
+ mp     :p_mount;
  error,flags,locktype,vfslocked:Integer;
 begin
  mp:=vp^.v_mount;
 
- if ((maxprotp^ and VM_PROT_WRITE)<>0) and ((flagsp^ and MAP_SHARED)<>0) then
+ objsize:=size;
+
+ if ((maxprotp^ and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))<>0) and ((flagsp^ and MAP_SHARED)<>0) then
   locktype:=LK_EXCLUSIVE
  else
   locktype:=LK_SHARED;
 
  vfslocked:=VFS_LOCK_GIANT(mp);
+
  error:=vget(vp, locktype);
  if (error<>0) then
  begin
   VFS_UNLOCK_GIANT(vfslocked);
   Exit(error);
  end;
+
  foff :=foffp^;
  flags:=flagsp^;
 
@@ -291,20 +289,28 @@ begin
  begin
   if ((va.va_flags and (SF_SNAPSHOT or IMMUTABLE or APPEND))<>0) then
   begin
-   if ((prot and VM_PROT_WRITE)<>0) then
+   if ((prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))<>0) then
    begin
     error:=EPERM;
     goto done;
    end;
-   maxprotp^:=maxprotp^ and (not VM_PROT_WRITE);
+   maxprotp^:=maxprotp^ and (not (VM_PROT_WRITE or VM_PROT_GPU_WRITE));
   end;
  end;
+
  {
   * If it is a regular file without any references
   * we do not need to sync it.
   * Adjust object size to be the size of actual file.
   }
  objsize:=round_page(va.va_size);
+
+ if ((foff+size)>objsize) then
+ begin
+  error:=EACCES;
+  goto done;
+ end;
+
  if (va.va_nlink=0) then
  begin
   flags:=flags or MAP_NOSYNC;
@@ -347,8 +353,8 @@ var
  error:Integer;
 begin
  if ((flagsp^ and MAP_SHARED)<>0) and
-    ((maxprotp^ and VM_PROT_WRITE)=0) and
-    ((prot and VM_PROT_WRITE)<>0) then
+    ((maxprotp^ and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))=0) and
+    ((prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))<>0) then
  begin
   Exit(EACCES);
  end;
@@ -409,11 +415,6 @@ begin
  end;
 end;
 
-function VMFS_ALIGNED_SPACE(x:QWORD):QWORD; inline; // find a range with fixed alignment
-begin
- Result:=x shl 8;
-end;
-
 function vm_mmap2(map        :vm_map_t;
                   addr       :p_vm_offset_t;
                   size       :vm_size_t;
@@ -425,8 +426,10 @@ function vm_mmap2(map        :vm_map_t;
                   foff       :vm_ooffset_t;
                   anon       :Pointer):Integer;
 var
+ _size:QWORD;
  obj:vm_object_t;
- docow,error,findspace,rv:Integer;
+ docow:DWORD;
+ error,findspace,rv:Integer;
  fitit:Boolean;
  writecounted:Boolean;
 begin
@@ -435,7 +438,9 @@ begin
 
  obj:=nil;
 
- size:=round_page(size);
+ //round_page
+ _size:=size+PAGE_MASK;
+ size :=_size and QWORD(not PAGE_MASK);
 
  if (map^.size + size) > lim_cur(RLIMIT_VMEM) then
  begin
@@ -478,9 +483,51 @@ begin
    begin
     error:=EACCES;
     if ((prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))=0) or
-       ((maxprot and VM_PROT_WRITE)<>0) then
+       ((maxprot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))<>0) then
     begin
      error:=vm_mmap_dmem(handle,size,foff,@obj);
+    end;
+   end;
+
+  OBJT_BLOCKPOOL:
+   begin
+    error:=EINVAL;
+    rv:=(flags and $1F000000);
+    if (foff=0) and
+       ((rv = 0) or
+        (rv >= $15000000)) and
+       (((flags and (MAP_SHARED or MAP_PRIVATE)) = MAP_SHARED) or
+        ((maxprot and prot and $33) = $33)) then
+    begin
+     //
+     if (rv = 0) then
+     begin
+      flags:=(flags and (not $1F000000)) or $15000000
+     end;
+     //
+     if ( ((flags and MAP_FIXED)<>0) and
+          (
+           ((addr^ and PAGE_2MB_MASK)<>0) or
+           ( (addr^ < QWORD($ff0000000)) and
+             (QWORD($7f0000000) <= (addr^ + size))
+           )
+
+          )
+        ) or
+        ((_size and QWORD(not PAGE_2MB_MASK)) <> size) then
+     begin
+      Exit(EINVAL);
+     end;
+     //
+     writecounted:=False;
+     obj:=vm_pager_allocate(OBJT_BLOCKPOOL,handle,size,$33,0);
+     //
+     if (obj=nil) then
+     begin
+      Exit(ENOMEM);
+     end;
+     //
+     error:=0;
     end;
    end;
 
@@ -508,9 +555,12 @@ begin
   if (handle=nil) then foff:=0;
  end else
  if ((flags and MAP_PREFAULT_READ)<>0) then
+ begin
   docow:=MAP_PREFAULT
- else
+ end else
+ begin
   docow:=MAP_PREFAULT_PARTIAL;
+ end;
 
  if ((flags and (MAP_ANON or MAP_SHARED))=0) then
  begin
@@ -560,8 +610,9 @@ begin
 
  if ((maxprot and prot)=prot) or
     ((addr^ shr 34) < 63) or
-    ((addr^ + size) < QWORD($fc00000001)) then
+    ((addr^ + size) <= MAP_AREA_END) then
  begin
+  prot:=maxprot and prot;
 
   if ((flags and MAP_STACK)<>0) then
   begin
@@ -572,58 +623,74 @@ begin
   end else
   if (fitit) then
   begin
-   if ((flags and MAP_ALIGNMENT_MASK)=MAP_ALIGNED_SUPER) then
+
+   findspace:=(flags shr MAP_ALIGNMENT_SHIFT) and $1f;
+   if (findspace < 14) then
    begin
-    findspace:=VMFS_SUPER_SPACE;
-   end else
-   if ((flags and MAP_ALIGNMENT_MASK)<>0) then
-   begin
-    findspace:=VMFS_ALIGNED_SPACE(flags shr MAP_ALIGNMENT_SHIFT);
-   end else
-   begin
-    findspace:=VMFS_OPTIMAL_SPACE;
+    findspace:=ord((flags and MAP_OPTIMAL_SPACE)<>0);
+    //
+    if (obj=nil) then
+    begin
+     //ANON
+     findspace:=VMFS_ANY_SPACE   + findspace * 3; //[VMFS_ANY_SPACE, VMFS_OPTIMAL_SPACE]
+    end else
+    if (obj^.otype<>OBJT_DEVICE) then
+    begin
+     //ANY OBJ
+     findspace:=VMFS_ANY_SPACE   + findspace * 3; //[VMFS_ANY_SPACE, VMFS_OPTIMAL_SPACE]
+    end else
+    begin
+     //OBJT_DEVICE
+     findspace:=VMFS_SUPER_SPACE + findspace * 3; //[VMFS_SUPER_SPACE, VMFS_OPTIMAL_SUPER]
+    end;
    end;
+
    rv:=vm_map_find(map, obj, foff, addr, size, findspace,
                    prot, maxprot,
                    docow,
+                   flags,
                    anon);
   end else
   begin
    rv:=vm_map_fixed(map, obj, foff, addr^, size,
         prot, maxprot,
+        flags,
         docow,
-        ((flags and MAP_NO_OVERWRITE)=0),
         anon);
   end;
 
  end;
 
+ if (handle_type=OBJT_BLOCKPOOL) and (rv=KERN_SUCCESS) then
+ begin
+  //
+ end else
  if (rv=KERN_SUCCESS) then
  begin
 
   if ((flags and MAP_SHARED)<>0) then
   begin
-   Result:=vm_map_inherit(map,addr^,addr^ + size,VM_INHERIT_SHARE);
-   if (Result<>0) then
+   rv:=vm_map_inherit(map,addr^,addr^ + size,VM_INHERIT_SHARE);
+   if (rv<>0) then
    begin
     vm_map_remove(map,addr^,addr^ + size);
-    Exit;
+    Exit(vm_mmap_to_errno(rv));
    end;
   end;
 
-  if ((map^.flags and MAP_WIREFUTURE)=0) or
-     ((flags and (MAP_SANITIZER or MAP_VOID))<>0) then
+  if ((map^.flags and MAP_WIREFUTURE)<>0) and
+     ((flags and (MAP_SANITIZER or MAP_VOID))=0) then
   begin
-   Exit;
-  end;
+   rv:=vm_map_wire(map,addr^,addr^ + size,
+                   (ord((map^.flags and MAP_LOCK_WIRE)<>0)*VM_MAP_WIRE_LOCK) or
+                   VM_MAP_WIRE_USER or
+                   VM_MAP_WIRE_HOLESOK);
 
-  Result:=vm_map_wire(map,addr^,addr^ + size,
-                      (ord((map^.flags and 4)<>0)*8) or VM_MAP_WIRE_USER or VM_MAP_WIRE_HOLESOK);
-
-  if (Result<>0) then
-  begin
-   vm_map_remove(map,addr^,addr^ + size);
-   Exit;
+   if (rv<>0) then
+   begin
+    vm_map_remove(map,addr^,addr^ + size);
+    Exit(vm_mmap_to_errno(rv));
+   end;
   end;
 
  end else
@@ -732,6 +799,8 @@ begin
   pos:=0;
  end;
 
+ flags:=flags and (not (MAP_2MB_ALIGN or MAP_OPTIMAL_SPACE));
+
  if ((flags and MAP_STACK)<>0) then
  begin
   if (fd<>-1) or
@@ -788,7 +857,7 @@ begin
     addr:=SCE_USR_HEAP_START;
    end;
   end else
-  if ((addr and QWORD($fffffffdffffffff))=0) then
+  if ((addr and QWORD(not $200000000))=0) then
   begin
    addr:=SCE_USR_HEAP_START;
   end else
@@ -801,22 +870,22 @@ begin
  if ((flags and MAP_VOID)<>0) then
  begin
   //MAP_VOID
-  handle:=nil;
+  handle     :=nil;
   handle_type:=OBJT_DEFAULT;
-  maxprot:=0;
+  maxprot    :=0;
   cap_maxprot:=0;
-  flags:=flags or MAP_ANON;
-  rights:=0;
-  prot:=0;
+  flags      :=flags or MAP_ANON;
+  rights     :=0;
+  prot       :=0;
   goto _map;
  end;
 
  if ((flags and MAP_ANON)<>0) then
  begin
   //Mapping blank space is trivial.
-  handle:=nil;
+  handle     :=nil;
   handle_type:=OBJT_DEFAULT;
-  maxprot:=VM_PROT_ALL;
+  maxprot    :=VM_PROT_ALL;
   cap_maxprot:=VM_PROT_ALL;
   goto _map;
  end;
@@ -847,13 +916,8 @@ begin
     begin
      vp:=fp^.f_vnode;
 
-     maxprot:=VM_PROT_EXECUTE;
-
-     if (vp^.v_mount<>nil) then
-     if ((p_mount(vp^.v_mount)^.mnt_flag and MNT_NOEXEC)<>0) then
-     begin
-      maxprot:=VM_PROT_NONE;
-     end;
+     //no VM_PROT_EXECUTE at all!
+     maxprot:=VM_PROT_NONE;
 
      if ((fp^.f_flag and FREAD)<>0) then
      begin
@@ -879,19 +943,19 @@ begin
      end else
      if (vp^.v_type<>VCHR) or ((fp^.f_flag and FWRITE)<>0) then
      begin
-      maxprot:=maxprot or (VM_PROT_WRITE or VM_PROT_GPU_WRITE);
+      maxprot    :=maxprot or (VM_PROT_WRITE or VM_PROT_GPU_WRITE);
       cap_maxprot:=cap_maxprot or (VM_PROT_WRITE or VM_PROT_GPU_WRITE);
      end;
 
-     handle:=vp;
+     handle     :=vp;
      handle_type:=OBJT_VNODE;
     end;
 
   DTYPE_SHM:
     begin
-     handle:=fp^.f_data;
+     handle     :=fp^.f_data;
      handle_type:=OBJT_SWAP;
-     maxprot:=VM_PROT_NONE;
+     maxprot    :=VM_PROT_NONE;
 
      // FREAD should always be set.
      if ((fp^.f_flag and FREAD)<>0) then
@@ -907,7 +971,7 @@ begin
 
   DTYPE_PHYSHM:
     begin
-     handle:=fp^.f_data;
+     handle     :=fp^.f_data;
      handle_type:=OBJT_PHYSHM;
 
      prot:=VM_PROT_READ or VM_PROT_GPU_READ;
@@ -927,9 +991,9 @@ begin
 
   DTYPE_BLOCKPOOL:
     begin
-     handle:=fp^.f_data;
+     handle     :=fp^.f_data;
      handle_type:=OBJT_BLOCKPOOL;
-     maxprot:=VM_PROT_ALL;
+     maxprot    :=VM_PROT_ALL;
     end;
 
   else
@@ -946,13 +1010,13 @@ _map:
 
  if (((flags and MAP_SANITIZER) <> 0) and (addr < QWORD($800000000000))) then //sv_maxuser
  begin
-  if (QWORD($fc00000000) < (addr + size)) then
+  if (MAP_AREA_END < (addr + size)) then
   begin
-   prot:=prot and $cf;
+   maxprot:=maxprot and $cf;
   end;
   if ((addr shr 34) > 62) then
   begin
-   prot:=prot and $cf;
+   maxprot:=maxprot and $cf;
   end;
  end;
 
@@ -964,19 +1028,21 @@ _map:
  Result:=Pointer(vm_mmap2(map,@addr,size,prot,maxprot,flags,handle_type,handle,pos,stack_addr));
  td^.td_fpop:=nil;
 
- td^.td_retval[0]:=(addr+pageoff);
-
  if (Result=nil) then
- if (stack_addr<>nil) then
  begin
-  //Do you really need it?
-  vm_map_set_name_str(map,addr,size + addr,'anon:'+LowerCase(HexStr(QWORD(stack_addr),12)));
+  td^.td_retval[0]:=(addr+pageoff);
+
+  if (stack_addr<>nil) then
+  begin
+   vm_map_set_name_str(map,addr,size + addr,'anon:'+LowerCase(HexStr(QWORD(stack_addr),12)));
+  end;
+
  end;
 
  Writeln('0x',HexStr(QWORD(stack_addr),11),'->',
          'sys_mmap(','0x',HexStr(QWORD(vaddr),11),
                     ',0x',HexStr(vlen,11),
-                    ',0x',HexStr(prot,1),
+                    ',0x',HexStr(prot,2),
                     ',0x',HexStr(flags,8),
                       ',',fd,
                     ',0x',HexStr(pos,11),
@@ -1232,37 +1298,6 @@ begin
 
 end;
 
-function sys_query_memory_protection(addr:Pointer;info:Pointer):Integer;
-var
- map:vm_map_t;
- _addr:vm_offset_t;
- __end:vm_offset_t;
- entry:vm_map_entry_t;
- data:t_query_memory_prot;
-begin
- Result:=EINVAL;
- _addr:=trunc_page(vm_offset_t(addr));
- map:=p_proc.p_vmspace;
- __end:=vm_map_max(map);
- if (_addr<__end) or (_addr=__end) then
- begin
-  vm_map_lock(map);
-  if not vm_map_lookup_entry(map,_addr,@entry) then
-  begin
-   vm_map_unlock(map);
-   Result:=EACCES;
-  end else
-  begin
-   data.start:=Pointer(entry^.start);
-   data.__end:=Pointer(entry^.__end);
-   data.prot:=(entry^.max_protection and entry^.protection);
-   data.eflags:=entry^.eflags;
-   vm_map_unlock(map);
-   Result:=copyout(@data,info,SizeOf(t_query_memory_prot));
-  end;
- end;
-end;
-
 const
  SCE_KERNEL_MAP_OP_MAP_DIRECT  =0;
  SCE_KERNEL_MAP_OP_UNMAP       =1;
@@ -1332,7 +1367,7 @@ begin
     SCE_KERNEL_MAP_OP_MAP_DIRECT:
       begin
 
-       if (p_proc.p_pool_id <> 1) or
+       if (p_proc.p_dmem_pool_id <> 1) or
           ((g_appinfo.mmap_flags and 2) <> 0) or
           ((flags and MAP_STACK) <> 0) or
           (p_proc.p_sdk_version < $2500000) then

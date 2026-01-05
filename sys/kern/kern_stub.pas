@@ -5,9 +5,6 @@ unit kern_stub;
 
 interface
 
-uses
- mqueue;
-
 {.$DEFINE chunk_alloc}
 
 const
@@ -19,14 +16,16 @@ const
 
 type
  p_stub_chunk=^stub_chunk;
- stub_chunk=packed record
+ stub_chunk=packed object
   head     :WORD;
   flags    :WORD;
   prev_size:Integer;
   curr_size:Integer;
   refs     :Integer;
-  link     :TAILQ_ENTRY;
+  pLeft    :p_stub_chunk;
+  pRight   :p_stub_chunk;
   body     :record end;
+  function c(n1,n2:p_stub_chunk):Integer; static;
  end;
 
 function  is_near_valid(vaddr,body:Pointer):Boolean;
@@ -41,8 +40,9 @@ procedure p_dec_ref(chunk:p_stub_chunk);
 implementation
 
 uses
+ g_node_splay,
  {$IFDEF chunk_alloc}
- hamt,
+ kern_hamt,
  {$ENDIF}
  kern_rwlock,
  vm,
@@ -50,18 +50,25 @@ uses
  vm_map,
  vm_mmap,
  md_map,
- sys_vm_object,
+ vm_object,
  kern_proc;
+
+function stub_chunk.c(n1,n2:p_stub_chunk):Integer;
+begin
+ Result:=Integer(n1^.curr_size>n2^.curr_size)-Integer(n1^.curr_size<n2^.curr_size);
+end;
+
+type
+ t_chunk_free=specialize TNodeSplay<stub_chunk>;
 
 var
  {$IFDEF chunk_alloc}
  chunk_alloc:array[Boolean] of TSTUB_HAMT64;
  {$ENDIF}
 
- chunk_free:array[Boolean] of TAILQ_HEAD=
+ chunk_free:array[Boolean] of t_chunk_free=
  (
-  (tqh_first:nil;tqh_last:@chunk_free[False].tqh_first),
-  (tqh_first:nil;tqh_last:@chunk_free[True ].tqh_first)
+  (pRoot:nil),(pRoot:nil)
  );
 
  chunk_lock:array[Boolean] of Pointer=(nil,nil);
@@ -118,25 +125,19 @@ begin
    start:=SCE_REPLAY_EXEC_START;
   end;
 
-  err:=vm_mmap2(map,
-                @start,
-                size,
-                VM_PROT_RWX,
-                VM_PROT_RWX,
-                MAP_ANON or MAP_PRIVATE,
-                OBJT_DEFAULT,
-                nil,
-                0,
-                nil);
+  err:=vm_map_find(map, nil,
+                   0, @start, size,
+                   VMFS_OPTIMAL_SPACE,
+                   VM_PROT_RWX, VM_PROT_RWX,
+                   MAP_COW_NO_BUDGET or MAP_COW_PATCH,
+                   0,
+                   nil);
 
   if (err<>0) then Exit;
 
-  vm_map_lock(map);
-  vm_map_set_info_locked(map,start,start+size,'#patch',VM_INHERIT_PATCH);
-  vm_map_unlock(map);
  end else
  begin
-  size:=AlignUp(size+SizeOf(stub_chunk),MD_PAGE_SIZE);
+  size:=AlignUp(size+SizeOf(stub_chunk),MD_ALLOC_GRANULARITY);
 
   if (start=0) then
   begin
@@ -155,8 +156,8 @@ begin
  Result^.prev_size    :=0;
  Result^.curr_size    :=size;
  Result^.refs         :=0;
- Result^.link.tqe_next:=nil;
- Result^.link.tqe_prev:=nil;
+ Result^.pLeft        :=nil;
+ Result^.pRight       :=nil;
 end;
 
 procedure free_segment(chunk:p_stub_chunk;guest:Boolean);
@@ -167,11 +168,23 @@ begin
  begin
   map:=p_proc.p_vmspace;
 
-  vm_map_remove(map, qword(chunk), qword(chunk) + chunk^.curr_size);
+  vm_map_remove(map, qword(chunk), qword(chunk) + chunk^.curr_size, MAP_COW_PATCH);
  end else
  begin
   md_unmap(chunk,chunk^.curr_size);
  end;
+end;
+
+procedure add_to_free_list(chunk:p_stub_chunk;guest:Boolean); inline;
+begin
+ chunk_free[guest].Insert(chunk);
+end;
+
+procedure del_from_free_list(chunk:p_stub_chunk;guest:Boolean); inline;
+begin
+ chunk_free[guest].Delete(chunk);
+ chunk^.pLeft :=nil;
+ chunk^.pRight:=nil;
 end;
 
 procedure fix_next_size(chunk:p_stub_chunk);
@@ -205,8 +218,8 @@ begin
  next^.prev_size    :=used_size;
  next^.curr_size    :=chunk_size-used_size;
  next^.refs         :=0;
- next^.link.tqe_next:=nil;
- next^.link.tqe_prev:=nil;
+ next^.pLeft        :=nil;
+ next^.pRight       :=nil;
 
  if ((chunk^.flags and m_last__chunk)<>0) then
  begin
@@ -214,7 +227,7 @@ begin
   next ^.flags:=next^.flags or m_last__chunk;
  end;
 
-TAILQ_INSERT_TAIL(@chunk_free[guest],next,@next^.link);
+ add_to_free_list(next,guest);
 
  fix_next_size(next);
 end;
@@ -233,9 +246,7 @@ begin
    Assert(prev^.curr_size=chunk^.prev_size,'invalid prev chunk curr_size');
    Assert(prev^.refs=0                    ,'invalid prev chunk refs');
 
-   TAILQ_REMOVE(@chunk_free[guest],prev,@prev^.link);
-
-   prev^.link:=Default(TAILQ_ENTRY);
+   del_from_free_list(prev,guest);
 
    prev^.curr_size:=prev^.curr_size+chunk^.curr_size;
 
@@ -259,9 +270,7 @@ begin
    Assert(next^.prev_size=chunk^.curr_size,'invalid next chunk prev_size');
    Assert(next^.refs=0                    ,'invalid next chunk refs');
 
-   TAILQ_REMOVE(@chunk_free[guest],next,@next^.link);
-
-   next^.link:=Default(TAILQ_ENTRY);
+   del_from_free_list(next,guest);
 
    chunk^.curr_size:=chunk^.curr_size+next^.curr_size;
 
@@ -279,55 +288,58 @@ end;
 
 function find_free_chunk(vaddr:Pointer;size:Integer;guest:Boolean):p_stub_chunk;
 var
- entry,next:p_stub_chunk;
+ stub:stub_chunk;
+ entry:p_stub_chunk;
 begin
  Result:=nil;
  size:=size+SizeOf(stub_chunk);
 
- entry:=TAILQ_FIRST(@chunk_free[guest]);
+ stub.curr_size:=size;
+ entry:=chunk_free[guest].Find_be(@stub);
 
  while (entry<>nil) do
  begin
-  next:=TAILQ_NEXT(entry,@entry^.link);
   //
   if (entry^.curr_size>=size) then
   begin
    if (vaddr=nil) or is_near_valid(vaddr,@entry^.body) then
    begin
-    TAILQ_REMOVE(@chunk_free[guest],entry,@entry^.link);
-    entry^.link:=Default(TAILQ_ENTRY);
+    del_from_free_list(entry,guest);
     Exit(entry);
    end;
   end;
   //
-  entry:=next;
+  entry:=chunk_free[guest].Next(entry);
  end;
+
 end;
 
 function find_free_chunk_m(vaddr:Pointer;size:Integer;mask:DWORD;guest:Boolean):p_stub_chunk;
 var
- entry,next:p_stub_chunk;
+ stub:stub_chunk;
+ entry:p_stub_chunk;
 begin
  Result:=nil;
  size:=size+SizeOf(stub_chunk);
- entry:=TAILQ_FIRST(@chunk_free[guest]);
+
+ stub.curr_size:=size;
+ entry:=chunk_free[guest].Find_be(@stub);
 
  while (entry<>nil) do
  begin
-  next:=TAILQ_NEXT(entry,@entry^.link);
   //
   if (entry^.curr_size>=size) then
   begin
    if is_mask_valid(vaddr,@entry^.body,mask) then
    begin
-    TAILQ_REMOVE(@chunk_free[guest],entry,@entry^.link);
-    entry^.link:=Default(TAILQ_ENTRY);
+    del_from_free_list(entry,guest);
     Exit(entry);
    end;
   end;
   //
-  entry:=next;
+  entry:=chunk_free[guest].Next(entry);
  end;
+
 end;
 
 function p_alloc(vaddr:Pointer;size:Integer;guest:Boolean):p_stub_chunk;
@@ -354,7 +366,7 @@ begin
     chunk:=alloc_segment(AlignUp(QWORD(vaddr)-High(Integer),PAGE_SIZE),size,guest);
    end else
    begin
-    chunk:=alloc_segment(AlignUp(QWORD(vaddr)-High(Integer),MD_PAGE_SIZE),size,guest);
+    chunk:=alloc_segment(AlignUp(QWORD(vaddr)-High(Integer),MD_ALLOC_GRANULARITY),size,guest);
    end;
 
    Assert(chunk<>nil,'p_alloc NOMEM');
@@ -460,7 +472,7 @@ begin
   free_segment(chunk,guest);
  end else
  begin
-  TAILQ_INSERT_TAIL(@chunk_free[guest],chunk,@chunk^.link);
+  add_to_free_list(chunk,guest);
  end;
 
  rw_wunlock(chunk_lock[guest]);

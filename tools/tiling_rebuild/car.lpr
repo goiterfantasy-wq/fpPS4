@@ -1,0 +1,2682 @@
+
+{$mode ObjFPC}{$H+}
+
+uses
+ bittype,
+ sysutils;
+
+Var
+ Fout:text;
+
+const
+ // Depth modes (for depth buffers)
+ kTileModeDepth_2dThin_64                   = $00000000; ///< Recommended for depth targets with one fragment per pixel.
+ kTileModeDepth_2dThin_128                  = $00000001; ///< Recommended for depth targets with two or four fragments per pixel, or texture-readable.
+ kTileModeDepth_2dThin_256                  = $00000002; ///< Recommended for depth targets with eight fragments per pixel.
+ kTileModeDepth_2dThin_512                  = $00000003; ///< Recommended for depth targets with 512-byte tiles.
+ kTileModeDepth_2dThin_1K                   = $00000004; ///< Recommended for depth targets with 1024-byte tiled.
+ kTileModeDepth_1dThin                      = $00000005; ///< Not used; included only for completeness.
+ kTileModeDepth_2dThinPrt_256               = $00000006; ///< Recommended for partially-resident depth surfaces. Does not support aliasing multiple virtual texture pages to the same physical page.
+ kTileModeDepth_2dThinPrt_1K                = $00000007; ///< Not used; included only for completeness.
+ // Display modes
+ kTileModeDisplay_LinearAligned             = $00000008; ///< Recommended for any surface to be easily accessed on the CPU.
+ kTileModeDisplay_1dThin                    = $00000009; ///< Not used; included only for completeness.
+ kTileModeDisplay_2dThin                    = $0000000A; ///< Recommended mode for displayable render targets.
+ kTileModeDisplay_ThinPrt                   = $0000000B; ///< Supports aliasing multiple virtual texture pages to the same physical page.
+ kTileModeDisplay_2dThinPrt                 = $0000000C; ///< Does not support aliasing multiple virtual texture pages to the same physical page.
+ // Thin modes (for non-displayable 1D/2D/3D surfaces)
+ kTileModeThin_1dThin                       = $0000000D; ///< Recommended for read-only non-volume textures.
+ kTileModeThin_2dThin                       = $0000000E; ///< Recommended for non-displayable intermediate render targets and read/write non-volume textures.
+ kTileModeThin_3dThin                       = $0000000F; ///< Not used; included only for completeness.
+ kTileModeThin_ThinPrt                      = $00000010; ///< Recommended for partially-resident textures (PRTs). Supports aliasing multiple virtual texture pages to the same physical page.
+ kTileModeThin_2dThinPrt                    = $00000011; ///< Does not support aliasing multiple virtual texture pages to the same physical page.
+ kTileModeThin_3dThinPrt                    = $00000012; ///< Does not support aliasing multiple virtual texture pages to the same physical page.
+ // Thick modes (for 3D textures)
+ kTileModeThick_1dThick                     = $00000013; ///< Recommended for read-only volume textures.
+ kTileModeThick_2dThick                     = $00000014; ///< Recommended for volume textures to which pixel shaders will write.
+ kTileModeThick_3dThick                     = $00000015; ///< Not used; included only for completeness.
+ kTileModeThick_ThickPrt                    = $00000016; ///< Supports aliasing multiple virtual texture pages to the same physical page.
+ kTileModeThick_2dThickPrt                  = $00000017; ///< Does not support aliasing multiple virtual texture pages to the same physical page.
+ kTileModeThick_3dThickPrt                  = $00000018; ///< Does not support aliasing multiple virtual texture pages to the same physical page.
+ kTileModeThick_2dXThick                    = $00000019; ///< Recommended for volume textures to which pixel shaders will write.
+ kTileModeThick_3dXThick                    = $0000001A; ///< Not used; included only for completeness.
+ // Hugely inefficient linear display mode -- do not use!
+ kTileModeDisplay_LinearGeneral             = $0000001F; ///< Unsupported; do not use!
+
+function isMicroTiled(tileMode:Byte):Boolean;
+begin
+ case tileMode of
+  kTileModeDepth_1dThin,
+  kTileModeDisplay_1dThin,
+  kTileModeThin_1dThin,
+  kTileModeThick_1dThick:
+    Result:=True;
+   else
+    Result:=False;
+ end;
+end;
+
+function isMacroTiled(tileMode:Byte):Boolean;
+begin
+ case tileMode of
+  kTileModeDepth_2dThin_64,
+  kTileModeDepth_2dThin_128,
+  kTileModeDepth_2dThin_256,
+  kTileModeDepth_2dThin_512,
+  kTileModeDepth_2dThin_1K,
+  kTileModeDepth_2dThinPrt_256,
+  kTileModeDepth_2dThinPrt_1K,
+  kTileModeDisplay_2dThin,
+  kTileModeDisplay_ThinPrt,
+  kTileModeDisplay_2dThinPrt,
+  kTileModeThin_2dThin,
+  kTileModeThin_3dThin,
+  kTileModeThin_ThinPrt,
+  kTileModeThin_2dThinPrt,
+  kTileModeThin_3dThinPrt,
+  kTileModeThick_2dThick,
+  kTileModeThick_3dThick,
+  kTileModeThick_ThickPrt,
+  kTileModeThick_2dThickPrt,
+  kTileModeThick_3dThickPrt,
+  kTileModeThick_2dXThick,
+  kTileModeThick_3dXThick:
+    Result:=True;
+   else
+    Result:=False;
+ end;
+end;
+
+type
+ TTILE_MODE_REG=bitpacked record
+  RESERVED0          :bit2;
+  ARRAY_MODE         :bit4; ///< Gnm::ArrayMode
+  PIPE_CONFIG        :bit5; ///< Gnm::PipeConfig
+  TILE_SPLIT         :bit3; ///< Gnm::TileSplit
+  RESERVED1          :bit8;
+  MICRO_TILE_MODE_NEW:bit3; ///< Gnm::MicroTileMode
+  SAMPLE_SPLIT       :bit2; ///< Gnm::SampleSplit
+  ALT_PIPE_CONFIG    :bit5; ///< NEO ONLY
+ end;
+
+ TMACRO_TILE_MODE_REG=bitpacked record
+  BANK_WIDTH           :bit2; ///< Gnm::BankWidth
+  BANK_HEIGHT          :bit2; ///< Gnm::BankHeight
+  MACRO_TILE_ASPECT    :bit2; ///< Gnm::MacroTileAspect
+  NUM_BANKS            :bit2; ///< Gnm::NumBanks
+  ALT_BANK_HEIGHT      :bit2; ///< NEO ONLY
+  ALT_MACRO_TILE_ASPECT:bit2; ///< NEO ONLY
+  ALT_NUM_BANKS        :bit2; ///< NEO ONLY
+  RESERVED0            :bit18;
+ end;
+
+ TTILE_MODE=packed record
+  Case Byte of
+   0:(B:TTILE_MODE_REG);
+   1:(D:DWORD);
+ end;
+
+ TMACRO_TILE_MODE=packed record
+  Case Byte of
+   0:(B:TMACRO_TILE_MODE_REG);
+   1:(D:DWORD);
+ end;
+
+const
+ GB_TILE_MODE:array[0..31] of TTILE_MODE=(
+  (D:$90800310), // GB_TILE_MODE0  0x00 kTileModeDepth_2dThin_64       am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Depth    ss=1
+  (D:$90800B10), // GB_TILE_MODE1  0x01 kTileModeDepth_2dThin_128      am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts= 128  mtm=Depth    ss=1
+  (D:$90801310), // GB_TILE_MODE2  0x02 kTileModeDepth_2dThin_256      am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts= 256  mtm=Depth    ss=1
+  (D:$90801B10), // GB_TILE_MODE3  0x03 kTileModeDepth_2dThin_512      am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts= 512  mtm=Depth    ss=1
+  (D:$90802310), // GB_TILE_MODE4  0x04 kTileModeDepth_2dThin_1K       am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=1024  mtm=Depth    ss=1
+  (D:$90800308), // GB_TILE_MODE5  0x05 kTileModeDepth_1dThin          am=1dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Depth    ss=1
+  (D:$90801318), // GB_TILE_MODE6  0x06 kTileModeDepth_2dThinPrt_256   am=2dTiledThinPrt   pipe/alt=P8_32x32_16x16/P16  ts= 256  mtm=Depth    ss=1
+  (D:$90802318), // GB_TILE_MODE7  0x07 kTileModeDepth_2dThinPrt_1K    am=2dTiledThinPrt   pipe/alt=P8_32x32_16x16/P16  ts=1024  mtm=Depth    ss=1
+  (D:$90000304), // GB_TILE_MODE8  0x08 kTileModeDisplay_LinearAligned am=LinearAligned    pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Display  ss=1
+  (D:$90000308), // GB_TILE_MODE9  0x09 kTileModeDisplay_1dThin        am=1dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Display  ss=1
+  (D:$92000310), // GB_TILE_MODE10 0x0A kTileModeDisplay_2dThin        am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Display  ss=2
+  (D:$92000294), // GB_TILE_MODE11 0x0B kTileModeDisplay_ThinPrt       am=TiledThinPrt     pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Display  ss=2
+  (D:$92000318), // GB_TILE_MODE12 0x0C kTileModeDisplay_2dThinPrt     am=2dTiledThinPrt   pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Display  ss=2
+  (D:$90400308), // GB_TILE_MODE13 0x0D kTileModeThin_1dThin           am=1dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thin     ss=1
+  (D:$92400310), // GB_TILE_MODE14 0x0E kTileModeThin_2dThin           am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thin     ss=2
+  (D:$924002B0), // GB_TILE_MODE15 0x0F kTileModeThin_3dThin           am=3dTiledThin      pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Thin     ss=2
+  (D:$92400294), // GB_TILE_MODE16 0x10 kTileModeThin_ThinPrt          am=TiledThinPrt     pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Thin     ss=2
+  (D:$92400318), // GB_TILE_MODE17 0x11 kTileModeThin_2dThinPrt        am=2dTiledThinPrt   pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thin     ss=2
+  (D:$9240032C), // GB_TILE_MODE18 0x12 kTileModeThin_3dThinPrt        am=3dTiledThinPrt   pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thin     ss=2
+  (D:$9100030C), // GB_TILE_MODE19 0x13 kTileModeThick_1dThick         am=1dTiledThick     pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thick    ss=1
+  (D:$9100031C), // GB_TILE_MODE20 0x14 kTileModeThick_2dThick         am=2dTiledThick     pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thick    ss=1
+  (D:$910002B4), // GB_TILE_MODE21 0x15 kTileModeThick_3dThick         am=3dTiledThick     pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Thick    ss=1
+  (D:$910002A4), // GB_TILE_MODE22 0x16 kTileModeThick_ThickPrt        am=TiledThickPrt    pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Thick    ss=1
+  (D:$91000328), // GB_TILE_MODE23 0x17 kTileModeThick_2dThickPrt      am=2dTiledThickPrt  pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thick    ss=1
+  (D:$910002BC), // GB_TILE_MODE24 0x18 kTileModeThick_3dThickPrt      am=3dTiledThickPrt  pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Thick    ss=1
+  (D:$91000320), // GB_TILE_MODE25 0x19 kTileModeThick_2dXThick        am=2dTiledXThick    pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Thick    ss=1
+  (D:$910002B8), // GB_TILE_MODE26 0x1A kTileModeThick_3dXThick        am=3dTiledXThick    pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Thick    ss=1
+  (D:$90C00308), // GB_TILE_MODE27 0x1B kTileModeRotated_1dThin        am=1dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Rotated  ss=1
+  (D:$92C00310), // GB_TILE_MODE28 0x1C kTileModeRotated_2dThin        am=2dTiledThin      pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Rotated  ss=2
+  (D:$92C00294), // GB_TILE_MODE29 0x1D kTileModeRotated_ThinPrt       am=TiledThinPrt     pipe/alt=P8_32x32_8x16 /P16  ts=  64  mtm=Rotated  ss=2
+  (D:$92C00318), // GB_TILE_MODE30 0x1E kTileModeRotated_2dThinPrt     am=2dTiledThinPrt   pipe/alt=P8_32x32_16x16/P16  ts=  64  mtm=Rotated  ss=2
+  (D:$00000000)  // GB_TILE_MODE31 0x1F kTileModeDisplay_LinearGeneral am=LinearGeneral    pipe/alt=P2            / P2  ts=  64  mtm=Display  ss=1
+  );
+
+ GB_MACROTILE_MODE:array[0..15] of TMACRO_TILE_MODE=(
+  (D:$26E8), // GB_MACROTILE_MODE0  0x00 kMacroTileMode_1x4_16      bankWidth=1 bankHeight=4 macroTileAspect=4 numBanks=16 altBankHeight=4 altNumBanks= 8 altMacroTileAspect=2
+  (D:$26D4), // GB_MACROTILE_MODE1  0x01 kMacroTileMode_1x2_16      bankWidth=1 bankHeight=2 macroTileAspect=2 numBanks=16 altBankHeight=4 altNumBanks= 8 altMacroTileAspect=2
+  (D:$21D0), // GB_MACROTILE_MODE2  0x02 kMacroTileMode_1x1_16      bankWidth=1 bankHeight=1 macroTileAspect=2 numBanks=16 altBankHeight=2 altNumBanks= 8 altMacroTileAspect=1
+  (D:$21D0), // GB_MACROTILE_MODE3  0x03 kMacroTileMode_1x1_16_dup  bankWidth=1 bankHeight=1 macroTileAspect=2 numBanks=16 altBankHeight=2 altNumBanks= 8 altMacroTileAspect=1
+  (D:$2080), // GB_MACROTILE_MODE4  0x04 kMacroTileMode_1x1_8       bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 8 altBankHeight=1 altNumBanks= 8 altMacroTileAspect=1
+  (D:$2040), // GB_MACROTILE_MODE5  0x05 kMacroTileMode_1x1_4       bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 4 altBankHeight=1 altNumBanks= 8 altMacroTileAspect=1
+  (D:$1000), // GB_MACROTILE_MODE6  0x06 kMacroTileMode_1x1_2       bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 2 altBankHeight=1 altNumBanks= 4 altMacroTileAspect=1
+  (D:$0000), // GB_MACROTILE_MODE7  0x07 kMacroTileMode_1x1_2_dup   bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 2 altBankHeight=1 altNumBanks= 2 altMacroTileAspect=1
+  (D:$36EC), // GB_MACROTILE_MODE8  0x08 kMacroTileMode_1x8_16      bankWidth=1 bankHeight=8 macroTileAspect=4 numBanks=16 altBankHeight=4 altNumBanks=16 altMacroTileAspect=2
+  (D:$26E8), // GB_MACROTILE_MODE9  0x09 kMacroTileMode_1x4_16_dup  bankWidth=1 bankHeight=4 macroTileAspect=4 numBanks=16 altBankHeight=4 altNumBanks= 8 altMacroTileAspect=2
+  (D:$21D4), // GB_MACROTILE_MODE10 0x0A kMacroTileMode_1x2_16_dup  bankWidth=1 bankHeight=2 macroTileAspect=2 numBanks=16 altBankHeight=2 altNumBanks= 8 altMacroTileAspect=1
+  (D:$20D0), // GB_MACROTILE_MODE11 0x0B kMacroTileMode_1x1_16_dup2 bankWidth=1 bankHeight=1 macroTileAspect=2 numBanks=16 altBankHeight=1 altNumBanks= 8 altMacroTileAspect=1
+  (D:$1080), // GB_MACROTILE_MODE12 0x0C kMacroTileMode_1x1_8_dup   bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 8 altBankHeight=1 altNumBanks= 4 altMacroTileAspect=1
+  (D:$1040), // GB_MACROTILE_MODE13 0x0D kMacroTileMode_1x1_4_dup   bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 4 altBankHeight=1 altNumBanks= 4 altMacroTileAspect=1
+  (D:$0000), // GB_MACROTILE_MODE14 0x0E kMacroTileMode_1x1_2_dup2  bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 2 altBankHeight=1 altNumBanks= 2 altMacroTileAspect=1
+  (D:$0000)  // GB_MACROTILE_MODE15 0x0F kMacroTileMode_1x1_2_dup3  bankWidth=1 bankHeight=1 macroTileAspect=1 numBanks= 2 altBankHeight=1 altNumBanks= 2 altMacroTileAspect=1
+ );
+
+function getArrayMode(outArrayMode:PByte;tmode:Byte):Integer;
+begin
+ Result:=-$7f2d0000;
+ if ((outArrayMode<>nil) and (tmode<$20)) then
+ begin
+  outArrayMode^:=GB_TILE_MODE[tmode].B.ARRAY_MODE;
+  Result:=0;
+ end;
+end;
+
+function getMicroTileMode(outMicroTileMode:PByte;tmode:Byte):Integer;
+begin
+ Result:=-$7f2d0000;
+ if ((outMicroTileMode<>nil) and (tmode<$20)) then
+ begin
+  outMicroTileMode^:=GB_TILE_MODE[tmode].B.MICRO_TILE_MODE_NEW;
+  Result:=0;
+ end;
+end;
+
+const
+ kMicroTileModeDisplay = $00000000; ///< Only for 64 bpp and below.
+ kMicroTileModeThin    = $00000001; ///< Non-displayable. Can be used for thin, thick, or X thick.
+ kMicroTileModeDepth   = $00000002; ///< Only mode supported by DB.
+ kMicroTileModeRotated = $00000003; ///< Rotated. Not supported by Gnm.
+ kMicroTileModeThick   = $00000004; ///< Thick and X thick, non-AA only.
+
+ kArrayModeLinearGeneral   = $00000000; ///< Linear pixel storage; no alignment or padding restrictions. DEPRECATED -- Do not use!
+ kArrayModeLinearAligned   = $00000001; ///< Linear pixel storage with some minor alignment requirements and internal padding.
+ kArrayMode1dTiledThin     = $00000002; ///< Micro-tile-only tiling for non-volume surfaces. Not valid for AA modes.
+ kArrayMode1dTiledThick    = $00000003; ///< Micro-tile-only tiling for volume surfaces (8x8x4 pixel micro-tiles). Not valid for AA modes.
+ kArrayMode2dTiledThin     = $00000004; ///< Macro-tile tiling for non-volume surfaces.
+ kArrayModeTiledThinPrt    = $00000005; ///< Macro-tile tiling for non-volume partially-resident texture (PRT) surfaces. Supports aliasing multiple virtual texture pages to the same physical page.
+ kArrayMode2dTiledThinPrt  = $00000006; ///< Macro-tile tiling for non-volume partially-resident texture (PRT) surfaces. Does not support aliasing multiple virtual texture pages to the same physical page.
+ kArrayMode2dTiledThick    = $00000007; ///< Macro-tile tiling for volume surfaces (8x8x4 pixel micro-tiles).
+ kArrayMode2dTiledXThick   = $00000008; ///< Macro-tile tiling for volume surfaces (8x8x8 pixel micro-tiles).
+ kArrayModeTiledThickPrt   = $00000009; ///< Micro-tile-only tiling for partially-resident texture (PRT) volume surfaces (8x8x4 pixel micro-tiles). Supports aliasing multiple virtual texture pages to the same physical page.
+ kArrayMode2dTiledThickPrt = $0000000a; ///< Macro-tile tiling for partially-resident texture (PRT) volume surfaces (8x8x4 pixel micro-tiles). Does not support aliasing multiple virtual texture pages to the same physical page.
+ kArrayMode3dTiledThinPrt  = $0000000b; ///< Macro-tile tiling for partially-resident texture (PRT) non-volume surfaces. Z slices are rotated by pipe. Does not support aliasing multiple virtual texture pages to the same physical page.
+ kArrayMode3dTiledThin     = $0000000c; ///< Macro-tile tiling for non-volume surfaces. Z slices are rotated by pipe.
+ kArrayMode3dTiledThick    = $0000000d; ///< Macro-tile tiling for volume surfaces (8x8x4 pixel micro-tiles). Z slices are rotated by pipe.
+ kArrayMode3dTiledXThick   = $0000000e; ///< Macro-tile tiling for volume surfaces (8x8x8 pixel micro-tiles). Z slices are rotated by pipe.
+ kArrayMode3dTiledThickPrt = $0000000f; ///< Macro-tile tiling for partially-resident texture (PRT) volume surfaces (8x8x4 pixel micro-tiles). Z slices are rotated by pipe. Does not support aliasing multiple virtual texture pages to the same physical page.
+
+function _getElementIndex(x,y,z,bitsPerElement,microTileMode,arrayMode:DWORD):DWORD;
+var
+ elem:DWORD;
+begin
+ elem:=0;
+ case microTileMode of
+  kMicroTileModeDisplay:
+    begin
+     case bitsPerElement of
+      8:
+        begin
+         elem:=elem or ( (x shr 0) and $1 ) shl 0;
+         elem:=elem or ( (x shr 1) and $1 ) shl 1;
+         elem:=elem or ( (x shr 2) and $1 ) shl 2;
+         elem:=elem or ( (y shr 1) and $1 ) shl 3;
+         elem:=elem or ( (y shr 0) and $1 ) shl 4;
+         elem:=elem or ( (y shr 2) and $1 ) shl 5;
+        end;
+      16:
+        begin
+         elem:=elem or ( (x shr 0) and $1 ) shl 0;
+         elem:=elem or ( (x shr 1) and $1 ) shl 1;
+         elem:=elem or ( (x shr 2) and $1 ) shl 2;
+         elem:=elem or ( (y shr 0) and $1 ) shl 3;
+         elem:=elem or ( (y shr 1) and $1 ) shl 4;
+         elem:=elem or ( (y shr 2) and $1 ) shl 5;
+        end;
+      32:
+        begin
+         elem:=elem or ( (x shr 0) and $1 ) shl 0;
+         elem:=elem or ( (x shr 1) and $1 ) shl 1;
+         elem:=elem or ( (y shr 0) and $1 ) shl 2;
+         elem:=elem or ( (x shr 2) and $1 ) shl 3;
+         elem:=elem or ( (y shr 1) and $1 ) shl 4;
+         elem:=elem or ( (y shr 2) and $1 ) shl 5;
+        end;
+      64:
+        begin
+         elem:=elem or ( (x shr 0) and $1 ) shl 0;
+         elem:=elem or ( (y shr 0) and $1 ) shl 1;
+         elem:=elem or ( (x shr 1) and $1 ) shl 2;
+         elem:=elem or ( (x shr 2) and $1 ) shl 3;
+         elem:=elem or ( (y shr 1) and $1 ) shl 4;
+         elem:=elem or ( (y shr 2) and $1 ) shl 5;
+        end;
+      else;
+       //Assert(false,'Unsupported bitsPerElement (%u) for displayable surface.');
+     end;
+    end;
+
+   kMicroTileModeThin,
+   kMicroTileModeDepth:
+     begin
+      elem:=elem or ( (x shr 0) and $1 ) shl 0;
+      elem:=elem or ( (y shr 0) and $1 ) shl 1;
+      elem:=elem or ( (x shr 1) and $1 ) shl 2;
+      elem:=elem or ( (y shr 1) and $1 ) shl 3;
+      elem:=elem or ( (x shr 2) and $1 ) shl 4;
+      elem:=elem or ( (y shr 2) and $1 ) shl 5;
+      //
+      case arrayMode of
+       kArrayMode2dTiledXThick,
+       kArrayMode3dTiledXThick:
+         begin
+          elem:=elem or ( (z shr 2) and $1 ) shl 8;
+         end;
+       kArrayMode1dTiledThick,
+       kArrayMode2dTiledThick,
+       kArrayMode3dTiledThick,
+       kArrayModeTiledThickPrt,
+       kArrayMode2dTiledThickPrt,
+       kArrayMode3dTiledThickPrt:
+         begin
+          elem:=elem or ( (z shr 0) and $1 ) shl 6;
+          elem:=elem or ( (z shr 1) and $1 ) shl 7;
+         end;
+       else;
+      end;
+      //
+     end;
+
+   kMicroTileModeThick:
+     begin
+      //
+      case arrayMode of
+       kArrayMode2dTiledXThick,
+       kArrayMode3dTiledXThick:
+         begin
+          elem:=elem or ( (z shr 2) and $1 ) shl 8;
+         end;
+       kArrayMode1dTiledThick,
+       kArrayMode2dTiledThick,
+       kArrayMode3dTiledThick,
+       kArrayModeTiledThickPrt,
+       kArrayMode2dTiledThickPrt,
+       kArrayMode3dTiledThickPrt:
+        case bitsPerElement of
+         8,16:
+           begin
+            elem:=elem or ( (x shr 0) and $1 ) shl 0;
+            elem:=elem or ( (y shr 0) and $1 ) shl 1;
+            elem:=elem or ( (x shr 1) and $1 ) shl 2;
+            elem:=elem or ( (y shr 1) and $1 ) shl 3;
+            elem:=elem or ( (z shr 0) and $1 ) shl 4;
+            elem:=elem or ( (z shr 1) and $1 ) shl 5;
+            elem:=elem or ( (x shr 2) and $1 ) shl 6;
+            elem:=elem or ( (y shr 2) and $1 ) shl 7;
+           end;
+         32:
+           begin
+            elem:=elem or ( (x shr 0) and $1 ) shl 0;
+            elem:=elem or ( (y shr 0) and $1 ) shl 1;
+            elem:=elem or ( (x shr 1) and $1 ) shl 2;
+            elem:=elem or ( (z shr 0) and $1 ) shl 3;
+            elem:=elem or ( (y shr 1) and $1 ) shl 4;
+            elem:=elem or ( (z shr 1) and $1 ) shl 5;
+            elem:=elem or ( (x shr 2) and $1 ) shl 6;
+            elem:=elem or ( (y shr 2) and $1 ) shl 7;
+           end;
+         64,128:
+           begin
+            elem:=elem or ( (x shr 0) and $1 ) shl 0;
+            elem:=elem or ( (y shr 0) and $1 ) shl 1;
+            elem:=elem or ( (z shr 0) and $1 ) shl 2;
+            elem:=elem or ( (x shr 1) and $1 ) shl 3;
+            elem:=elem or ( (y shr 1) and $1 ) shl 4;
+            elem:=elem or ( (z shr 1) and $1 ) shl 5;
+            elem:=elem or ( (x shr 2) and $1 ) shl 6;
+            elem:=elem or ( (y shr 2) and $1 ) shl 7;
+           end;
+          else;
+           //Assert(false,'Invalid bitsPerElement (%u) for microTileMode=kMicroTileModeThick.');
+        end;
+      else;
+       //Assert(false,'Invalid arrayMode (0x%02X) for thick/xthick microTileMode=kMicroTileModeThick.');
+      end;
+     end;
+ end;
+
+ Result:=elem;
+end;
+
+type
+ t_bits_per_element=(b8,b16,b32,b64,b128);
+
+ t_micro_tile_modes =Set of 0..4;
+ t_bits_per_elements=Set of t_bits_per_element;
+ t_array_modes      =Set of 0..$f;
+
+var
+ g_microTileMode :t_micro_tile_modes;
+ g_bitsPerElement:t_bits_per_elements;
+ g_arrayMode     :t_array_modes;
+
+procedure set_mtm(microTileMode:t_micro_tile_modes);
+begin
+ g_microTileMode:=microTileMode;
+end;
+
+procedure set_bpe(bitsPerElement:t_bits_per_elements);
+begin
+ g_bitsPerElement:=bitsPerElement;
+end;
+
+procedure set_arm(arrayMode:t_array_modes);
+begin
+ g_arrayMode:=arrayMode;
+end;
+
+type
+ t_axis=(m__,m_x,m_y,m_z,m_i);
+
+const
+ axis_str:array[t_axis] of Char=('_','x','y','z','i');
+ bits_str:array[t_bits_per_element] of String=('8','16','32','64','128');
+ mtm_str :array[0..4] of String=('Display','Thin','Depth','Rotated','Thick');
+
+ am_str  :array[0..$F] of String=(
+  'LinearGeneral',
+  'LinearAligned',
+  '1dTiledThin',
+  '1dTiledThick',
+  '2dTiledThin',
+  'TiledThinPrt',
+  '2dTiledThinPrt',
+  '2dTiledThick',
+  '2dTiledXThick',
+  'TiledThickPrt',
+  '2dTiledThickPrt',
+  '3dTiledThinPrt',
+  '3dTiledThin',
+  '3dTiledThick',
+  '3dTiledXThick',
+  '3dTiledThickPrt'
+ );
+
+
+type
+ t_biti=record
+  xyz:t_axis;
+  bit:Byte; //0..2
+ end;
+
+ t_bits=object
+  num:Byte;
+  bit:array[0..8] of t_biti;
+  procedure set_elm(xyz:t_axis;m_shr,m_and,m_shl:Byte);
+ end;
+
+var
+ g_bits:t_bits;
+
+procedure t_bits.set_elm(xyz:t_axis;m_shr,m_and,m_shl:Byte);
+begin
+ Assert(m_and=1);
+
+ if (num<m_shl) then num:=m_shl;
+
+ bit[m_shl].xyz:=xyz;
+ bit[m_shl].bit:=m_shr;
+end;
+
+//elem:=elem or ( (x shr 0) and $1 ) shl 0;
+//                       0..2            0..8
+procedure set_elm(xyz:t_axis;m_shr,m_and,m_shl:Byte);
+begin
+ g_bits.set_elm(xyz,m_shr,m_and,m_shl);
+end;
+
+function Is_1d_Thin(tiling:Byte):Boolean;
+var
+ ArrayMode:Byte;
+ ra:Integer;
+begin
+ ra:=getArrayMode(@ArrayMode,tiling);
+ Result:=(ra=0) and (ArrayMode=kArrayMode1dTiledThin);
+end;
+
+type
+ t_tilings=Set of 0..$1F;
+
+function get_tilings():t_tilings;
+var
+ i:Byte;
+ ra,rm:Integer;
+
+ ArrayMode    :Byte;
+ MicroTileMode:Byte;
+
+begin
+ Result:=[];
+
+ For i:=0 to High(t_tilings) do
+ begin
+  ra:=getArrayMode    (@ArrayMode    ,i);
+  rm:=getMicroTileMode(@MicroTileMode,i);
+
+  if (ra=0) and (rm=0) then
+  if (g_arrayMode=[])     or (ArrayMode     in g_arrayMode    ) then
+  if (g_microTileMode=[]) or (MicroTileMode in g_microTileMode) then
+  begin
+   Result:=Result+[i];
+  end;
+
+ end;
+
+end;
+
+function filter_1d_Thin(TS:t_tilings):t_tilings;
+var
+ i:Byte;
+begin
+ Result:=TS;
+ For i:=0 to High(t_tilings) do
+ if not Is_1d_Thin(i) then
+ begin
+  Result:=Result-[i];
+ end;
+end;
+
+function filter_MicroTiled(TS:t_tilings):t_tilings;
+var
+ i:Byte;
+begin
+ Result:=TS;
+ For i:=0 to High(t_tilings) do
+ if not isMicroTiled(i) then
+ begin
+  Result:=Result-[i];
+ end;
+end;
+
+procedure mark_end;
+var
+ i,g:Byte;
+ A,B,M,T:RawByteString;
+ TS:t_tilings;
+
+ AXISS:array[t_axis] of t_bits;
+begin
+ M:='';
+ For i:=0 to High(t_micro_tile_modes) do
+ if i in g_microTileMode then
+ begin
+  if M<>'' then M:=M+',';
+  M:=M+mtm_str[i];
+ end;
+
+ B:='';
+ For i:=ord(Low(t_bits_per_elements)) to ord(High(t_bits_per_elements)) do
+ if t_bits_per_element(i) in g_bitsPerElement then
+ begin
+  if B<>'' then B:=B+',';
+  B:=B+bits_str[t_bits_per_element(i)];
+ end;
+
+ A:='';
+ For i:=0 to High(t_array_modes) do
+ if i in g_arrayMode then
+ begin
+  if A<>'' then A:=A+',';
+  A:=A+am_str[i];
+ end;
+
+ TS:=filter_MicroTiled(get_tilings());
+
+ if (TS=[]) then Exit;
+
+ T:='';
+ For i:=0 to High(t_tilings) do
+ if i in TS then
+ begin
+  if T<>'' then T:=T+',';
+  T:=T+IntToStr(i);
+ end;
+
+ Writeln('M:[',M,'] B:[',B,'] A:[',A,'] Tilings:[',T,']');
+
+ Write('i=');
+ For i:=0 to g_bits.num do
+ begin
+  Write('[',axis_str[g_bits.bit[i].xyz],':',g_bits.bit[i].bit,']');
+ end;
+ Writeln;
+
+ FillChar(AXISS,sizeof(AXISS),0);
+
+ For i:=0 to g_bits.num do
+ begin
+  AXISS[g_bits.bit[i].xyz].set_elm(m_i,g_bits.bit[i].bit,1,i);
+ end;
+
+
+ For g:=ord(m_x) to ord(m_z) do
+ begin
+  A:='';
+
+  For i:=0 to g_bits.num do
+  begin
+   //Write('[',axis_str[AXISS[t_axis(g)].bit[i].xyz],':',AXISS[t_axis(g)].bit[i].bit,']');
+
+   if AXISS[t_axis(g)].bit[i].xyz=m_i then
+   begin
+    if (A<>'') then A:=A+' or ';
+
+    A:=A+'(((i shr '+IntToStr(i)+') and 1) shl '+IntToStr(AXISS[t_axis(g)].bit[i].bit)+')';
+   end;
+
+  end;
+
+  Writeln(axis_str[t_axis(g)],':=',A,';');
+ end;
+
+ //elem:=elem or ( (x shr 0) and $1 ) shl 0;
+
+ Writeln('---');
+ //
+end;
+
+procedure _getAxis_display_1dThin(i,bitsPerElement:Byte;var x,y:Byte);
+var
+ t:Byte;
+begin
+ case bitsPerElement of
+  8:
+   begin
+    x:=(((i shr 0) and 1) shl 0) or (((i shr 1) and 1) shl 1) or (((i shr 2) and 1) shl 2);
+    y:=(((i shr 3) and 1) shl 1) or (((i shr 4) and 1) shl 0) or (((i shr 5) and 1) shl 2);
+   end;
+
+  16:
+   begin
+    x:=(((i shr 0) and 1) shl 0) or (((i shr 1) and 1) shl 1) or (((i shr 2) and 1) shl 2);
+    y:=(((i shr 3) and 1) shl 0) or (((i shr 4) and 1) shl 1) or (((i shr 5) and 1) shl 2);
+   end;
+
+  32:
+   begin
+    x:=(((i shr 0) and 1) shl 0) or (((i shr 1) and 1) shl 1) or (((i shr 3) and 1) shl 2);
+    y:=(((i shr 2) and 1) shl 0) or (((i shr 4) and 1) shl 1) or (((i shr 5) and 1) shl 2);
+   end;
+
+  64:
+   begin
+    x:=(((i shr 0) and 1) shl 0) or (((i shr 2) and 1) shl 1) or (((i shr 3) and 1) shl 2);
+    y:=(((i shr 1) and 1) shl 0) or (((i shr 4) and 1) shl 1) or (((i shr 5) and 1) shl 2);
+   end;
+
+  else;
+ end;
+
+ t:=_getElementIndex(x,y,0,bitsPerElement,kMicroTileModeDisplay,kArrayMode1dTiledThin);
+
+ Assert(t=i);
+
+end;
+
+procedure _getAxis_Thin_1dThin(i,bitsPerElement:Byte;var x,y:Byte);
+var
+ t:Byte;
+begin
+ x:=(((i shr 0) and 1) shl 0) or (((i shr 2) and 1) shl 1) or (((i shr 4) and 1) shl 2);
+ y:=(((i shr 1) and 1) shl 0) or (((i shr 3) and 1) shl 1) or (((i shr 5) and 1) shl 2);
+
+ t:=_getElementIndex(x,y,0,bitsPerElement,kMicroTileModeThin,kArrayMode1dTiledThin);
+
+ Assert(t=i);
+end;
+
+procedure _getAxis_Thick_1dThick(i,bitsPerElement:Byte;var x,y,z:Byte);
+var
+ t:Byte;
+begin
+ //x -> 3bit,y -> 3bits,z -> 2bits = 8bits
+
+ case bitsPerElement of
+  8,16:
+   begin
+    x:=(((i shr 0) and 1) shl 0) or (((i shr 2) and 1) shl 1) or (((i shr 6) and 1) shl 2);
+    y:=(((i shr 1) and 1) shl 0) or (((i shr 3) and 1) shl 1) or (((i shr 7) and 1) shl 2);
+    z:=(((i shr 4) and 1) shl 0) or (((i shr 5) and 1) shl 1);
+   end;
+  32:
+   begin
+    x:=(((i shr 0) and 1) shl 0) or (((i shr 2) and 1) shl 1) or (((i shr 6) and 1) shl 2);
+    y:=(((i shr 1) and 1) shl 0) or (((i shr 4) and 1) shl 1) or (((i shr 7) and 1) shl 2);
+    z:=(((i shr 3) and 1) shl 0) or (((i shr 5) and 1) shl 1);
+   end;
+  64,128:
+   begin
+    x:=(((i shr 0) and 1) shl 0) or (((i shr 3) and 1) shl 1) or (((i shr 6) and 1) shl 2);
+    y:=(((i shr 1) and 1) shl 0) or (((i shr 4) and 1) shl 1) or (((i shr 7) and 1) shl 2);
+    z:=(((i shr 2) and 1) shl 0) or (((i shr 5) and 1) shl 1);
+   end;
+  else;
+ end;
+
+ t:=_getElementIndex(x,y,z,bitsPerElement,kMicroTileModeThick,kArrayMode1dTiledThick);
+
+ Assert(t=i);
+end;
+
+function fastIntLog2(i:DWORD):DWORD; inline;
+begin
+ Result:=BsrDWord(i or 1);
+end;
+
+type
+ t_1d_mode=(mThin,mDisplay,mThick);
+
+ tbit_interval=record
+  pos_i:Word;
+  srt_x:Byte;
+  end_x:Byte;
+      y:Byte;
+      z:Byte;
+  bitcn:Word;
+ end;
+
+ tbit_interval_array=object
+  num_i:Byte;
+  pos_i:Word;
+  intervals:array[0..127] of tbit_interval;
+  Procedure Add(srt_x,end_x,y,z:Byte;bitcn:Word);
+  Procedure Add(const v:tbit_interval);
+  procedure Sort_xyz;
+  procedure Sort_pos;
+ end;
+
+Procedure tbit_interval_array.Add(srt_x,end_x,y,z:Byte;bitcn:Word);
+begin
+ Assert(num_i<Length(intervals));
+
+ Assert(bitcn<>0);
+
+ intervals[num_i].pos_i:=pos_i;
+ intervals[num_i].srt_x:=srt_x;
+ intervals[num_i].end_x:=end_x;
+ intervals[num_i].    y:=    y;
+ intervals[num_i].    z:=    z;
+ intervals[num_i].bitcn:=bitcn;
+ //
+ pos_i:=pos_i+bitcn;
+ num_i:=num_i+1;
+end;
+
+Procedure tbit_interval_array.Add(const v:tbit_interval);
+begin
+ intervals[num_i]:=v;
+ //
+ num_i:=num_i+1;
+end;
+
+Procedure tbit_interval_array.Sort_xyz;
+var
+ i,k,g:Byte;
+ val1,val2:Word;
+ tmp:tbit_interval;
+begin
+ For k:=0 to num_i-1 do
+ For i:=0 to num_i-2 do
+ begin
+
+  with intervals[i+0] do
+  if (bitcn<=64) then
+  begin
+   g:=8
+  end else
+  begin
+   g:=16;
+  end;
+
+  with intervals[i+0] do
+  begin
+   val1:=srt_x+y*8+z*8*8;
+
+   val1:=val1+256*(((pos_i div 8) div 32) div g); //bits->bytes->ymm->ymm group
+  end;
+
+  with intervals[i+1] do
+  begin
+   val2:=srt_x+y*8+z*8*8;
+
+   val2:=val2+256*(((pos_i div 8) div 32) div g); //bits->bytes->ymm->ymm group
+  end;
+
+  if (val1>val2) then
+  begin
+   tmp:=intervals[i+1];
+   intervals[i+1]:=intervals[i+0];
+   intervals[i+0]:=tmp;
+  end;
+
+ end;
+end;
+
+Procedure tbit_interval_array.Sort_pos;
+var
+ i,k:Byte;
+ val1,val2:Word;
+ tmp:tbit_interval;
+begin
+ For k:=0 to num_i-1 do
+ For i:=0 to num_i-2 do
+ begin
+  with intervals[i+0] do
+   val1:=pos_i;
+
+  with intervals[i+1] do
+   val2:=pos_i;
+
+  if (val1>val2) then
+  begin
+   tmp:=intervals[i+1];
+   intervals[i+1]:=intervals[i+0];
+   intervals[i+0]:=tmp;
+  end;
+
+ end;
+end;
+
+var
+ g_axis_intervals:array[t_bits_per_element] of tbit_interval_array;
+
+const
+ Thin_Display_Thick     :array[t_1d_mode] of Pchar=('Thin','Display','Thick');
+ linear2tile_tile2linear:array[Boolean] of Pchar=('linear2tile','tile2linear');
+
+function getThick(mode:t_1d_mode):Byte;
+begin
+ if (mode=mThick) then
+ begin
+  Result:=4;
+ end else
+ begin
+  Result:=1;
+ end;
+end;
+
+function getLastBit(mode:t_1d_mode):Byte;
+begin
+ if (mode=mDisplay) then
+ begin
+  Result:=ord(b64);
+ end else
+ begin
+  Result:=ord(b128);
+ end;
+end;
+
+Procedure Iterate_Axiss_1dThin(mode:t_1d_mode);
+var
+ x,y,z:Byte;
+ b:Byte;
+ bytes:Word;
+ bit:Word;
+ all:Word;
+ i:Byte;
+ out_x,out_y,out_z:Byte;
+ prv_x,prv_y,prv_z:Byte;
+ str_x:Byte;
+begin
+ Writeln('[',Thin_Display_Thick[mode],']');
+
+ For b:=ord(b8) to getLastBit(mode) do
+ begin
+  g_axis_intervals[t_bits_per_element(b)]:=Default(tbit_interval_array);
+
+  bytes:=(1 shl b);
+  bit:=bytes shl 3;
+  all:=bytes*64*getThick(mode);
+
+  Writeln('[',bit,']:all=',all,'bytes');
+
+  For z:=0 to getThick(mode)-1 do
+  For y:=0 to 7 do
+  begin
+   For x:=0 to 7 do
+   begin
+    i:=x+(y*8)+(z*8*8);
+
+    out_x:=0;
+    out_y:=0;
+    out_z:=0;
+
+    case mode of
+     mThin   :_getAxis_Thin_1dThin   (i,bit,out_x,out_y);
+     mDisplay:_getAxis_display_1dThin(i,bit,out_x,out_y);
+     mThick  :_getAxis_Thick_1dThick (i,bit,out_x,out_y,out_z);
+    end;
+
+    //Write(out_x,',',out_y,' ');
+
+    if (x=0) then
+    begin
+     //start
+     str_x:=out_x;
+     prv_x:=out_x;
+     prv_y:=out_y;
+     prv_z:=out_z;
+    end else
+    begin
+
+     if (prv_x+1=out_x) and
+        (prv_y  =out_y) and
+        (prv_z  =out_z) then
+     begin
+      //
+     end else
+     begin
+      g_axis_intervals[t_bits_per_element(b)].Add(str_x,prv_x,prv_y,prv_z,(bit)*(prv_x-str_x+1));
+
+      Write(str_x,'..',prv_x,':',prv_y,':',prv_z,':',(bit)*(prv_x-str_x+1),'bit ');
+
+      //reset
+      str_x:=out_x;
+     end;
+
+     prv_x:=out_x;
+     prv_y:=out_y;
+     prv_z:=out_z;
+    end;
+
+   end;
+
+   g_axis_intervals[t_bits_per_element(b)].Add(str_x,prv_x,prv_y,prv_z,(bit)*(prv_x-str_x+1));
+
+   Write(str_x,'..',prv_x,':',prv_y,':',prv_z,':',(bit)*(prv_x-str_x+1),'bit ');
+
+   Writeln;
+  end;
+ end;
+
+end;
+
+//rdi(dst),rsi(src),rdx(pitch),rcx(slice)
+
+//rax, r8, r9, r10, r11
+
+const
+ reg_dst  ='%rdi';
+ reg_src  ='%rsi';
+ reg_pitch='%rdx';
+ reg_slice='%rcx';
+
+ reg_savez='%rax';
+
+ reg_tmp:array[0..2] of pchar=(
+  '%r8 ',
+  '%r9 ',
+  '%r10'
+ );
+
+type
+ t_lea_used_y=object
+  flags  :Byte;
+  is_used:Boolean;
+  need_z :Boolean;
+  init_z :Boolean;
+  last_z :Integer;
+  a_lea:array[0..3] of RawByteString;
+  a_ofs:array[0..7] of RawByteString;
+  a_reg_dst:RawByteString;
+  procedure _init(const A:tbit_interval_array);
+  procedure _set(y:Byte);
+  procedure _build_str(const reg_dst:RawByteString);
+  procedure _print;
+  procedure _print_prepare_z(diff_z:Integer);
+ end;
+
+procedure t_lea_used_y._init(const A:tbit_interval_array);
+var
+ i:Integer;
+ prev_z,diff_z:Integer;
+begin
+ Self:=Default(t_lea_used_y);
+
+ with A do
+ begin
+  //
+  prev_z:=intervals[0].z;
+  //
+  For i:=0 to num_i-1 do
+  begin
+   _set(intervals[i].y);
+   //
+   diff_z:=intervals[i].z-prev_z;
+   prev_z:=intervals[i].z;
+   //
+   need_z:=need_z or (diff_z=-3);
+  end;
+ end;
+end;
+
+procedure t_lea_used_y._set(y:Byte);
+begin
+ Assert(y<8);
+ flags:=flags or (1 shl y)
+end;
+
+procedure t_lea_used_y._build_str(const reg_dst:RawByteString);
+begin
+ a_reg_dst:=reg_dst;
+ //
+ if ((flags and (1 shl 2))<>0) or ((flags and (1 shl 3))<>0) then
+ begin
+  a_lea[0]:='('+reg_dst+','+reg_pitch+',2), '+reg_tmp[0]+' //+2'; //+2 +3
+ end;
+ if ((flags and (1 shl 4))<>0) or ((flags and (1 shl 5))<>0) then
+ begin
+  a_lea[1]:='('+reg_dst+','+reg_pitch+',4), '+reg_tmp[1]+' //+4'; //+4 +5
+ end;
+ if ((flags and (1 shl 6))<>0) or ((flags and (1 shl 7))<>0) then
+ begin
+  a_lea[2]:='('+reg_pitch+','+reg_pitch +',2), '+reg_tmp[2]+' //+3'; //+3
+  a_lea[3]:='('+reg_dst  +','+reg_tmp[2]+',2), '+reg_tmp[2]+' //+6'; //+6 +7
+ end;
+ //
+ a_ofs[0]:='('+reg_dst+')'            ;      //     +0
+ a_ofs[1]:='('+reg_dst+','+reg_pitch+')';    //     +1
+ a_ofs[2]:='('+reg_tmp[0]+')'            ;   //     +2
+ a_ofs[3]:='('+reg_tmp[0]+','+reg_pitch+')'; //+2+1 +3
+ a_ofs[4]:='('+reg_tmp[1]+')'            ;   //     +4
+ a_ofs[5]:='('+reg_tmp[1]+','+reg_pitch+')'; //+4+1 +5
+ a_ofs[6]:='('+reg_tmp[2]+')'            ;   //     +6
+ a_ofs[7]:='('+reg_tmp[2]+','+reg_pitch+')'; //+6+1 +7
+ //
+ init_z:=False;
+end;
+
+procedure t_lea_used_y._print;
+var
+ i:Byte;
+begin
+ if is_used then Exit;
+ //
+ For i:=0 to High(a_lea) do
+ if (a_lea[i]<>'') then
+ begin
+  Writeln(Fout,'lea ':18,a_lea[i]);
+ end;
+ //
+ is_used:=True;
+end;
+
+procedure t_lea_used_y._print_prepare_z(diff_z:Integer);
+begin
+ if is_used then
+ begin
+
+  if need_z and (not init_z) and (diff_z<>0) then
+  begin
+   last_z:=0;
+   init_z:=True;
+   //save
+   Writeln(Fout,'mov ':18,a_reg_dst,', ',reg_savez,' //save z');
+  end;
+
+  if init_z then
+  begin
+   last_z:=last_z+diff_z;
+  end;
+
+  case diff_z of
+   0:;
+   1:
+    begin
+     Writeln(Fout,'lea ':18,'(',a_reg_dst,',',reg_slice,')',', ',a_reg_dst,' //z+1');
+     is_used:=False;
+    end;
+   -1:
+    begin
+     Writeln(Fout,'sub ':18,reg_slice,', ',a_reg_dst,' //z-1');
+     is_used:=False;
+    end;
+   -3:
+    begin
+     if init_z and (last_z=0) then
+     begin
+      //restore
+      Writeln(Fout,'mov ':18,reg_savez,', ',a_reg_dst,' //restore z');
+     end else
+     begin
+      Writeln(Fout,'sub ':18,reg_slice,', ',a_reg_dst,' //z-1');
+      Writeln(Fout,'sub ':18,reg_slice,', ',a_reg_dst,' //z-1');
+      Writeln(Fout,'sub ':18,reg_slice,', ',a_reg_dst,' //z-1');
+     end;
+     is_used:=False;
+    end;
+   else
+    Assert(False);
+  end;
+ end;
+end;
+
+type
+ t_context=object
+  var
+   bytes    :Word;
+   reg_count:Word;
+   reg_max  :Word;
+   reg_ext  :Word;
+   last_grp :Integer;
+   flags    :QWORD;
+   diff_z   :Integer;
+   //
+   regs_ids :array[0..15] of Smallint;
+   regs_cnt :array[0..15] of Word;
+   //
+  procedure reset;
+  procedure _init(bitcn:Word);
+  procedure init_load(bitcn:Word);
+  procedure init_write(bitcn:Word);
+  procedure _print_load_group(start:Integer);
+  function  translate_reg(reg_num,reg_mod:Word):Word;
+  function  get_offset(reg_mod:Word):Word;
+  procedure load_from(reg_num:Word);
+  procedure write_to(reg_num,bitcn:Word);
+  procedure flush_write;
+ end;
+
+procedure t_context.reset;
+var
+ i:Integer;
+begin
+ reg_max:=0;
+ reg_ext:=0;
+ last_grp:=0;
+ flags:=0;
+ For i:=0 to 15 do
+ begin
+  regs_ids[i]:=-1;
+  regs_cnt[i]:=0;
+ end;
+end;
+
+procedure t_context._init(bitcn:Word);
+begin
+ if (reg_count>16) then
+ begin
+  reg_max:=16;
+ end else
+ begin
+  reg_max:=reg_count;
+ end;
+
+ if (bitcn<=64) then
+ begin
+  //alloc extended space
+
+  //shrink
+  while (reg_max*2>16) do
+  begin
+   reg_max:=reg_max div 2;
+  end;
+
+  reg_max:=reg_max;
+  reg_ext:=reg_max*2;
+ end;
+end;
+
+procedure t_context.init_load(bitcn:Word);
+begin
+ if (reg_max<>0) then Exit;
+
+ _init(bitcn);
+
+ _print_load_group(0);
+end;
+
+procedure t_context.init_write(bitcn:Word);
+begin
+ if (reg_max<>0) then Exit;
+
+ _init(bitcn);
+end;
+
+procedure t_context._print_load_group(start:Integer);
+var
+ r,n:Integer;
+begin
+ For r:=start to (start+reg_max)-1 do
+ begin
+  n:=r mod reg_max;
+  Writeln(Fout,'vmovups ':18,r*32:3,'(',reg_src,')',', ',('%ymm'+IntToStr(n)):0,' //ymm',n,'=data[',r,']');
+  regs_ids[n]:=r;
+ end;
+
+ //preload ext
+ if (reg_ext<>0) then
+ For r:=0 to reg_max-1 do
+ begin
+  Writeln(Fout,'vextractf128 $1, ':18,('%ymm'+IntToStr(r)):6,', %xmm',(r+reg_max));
+ end;
+end;
+
+function t_context.translate_reg(reg_num,reg_mod:Word):Word;
+var
+ i,r,e:Integer;
+begin
+ r:=reg_num mod 16;
+ r:=r mod reg_max;
+
+ e:=0;
+ if (reg_ext<>0) then
+ if (reg_mod>=16) then
+ begin
+  e:=1;
+ end;
+
+ For i:=0 to reg_max-1 do
+ if (regs_ids[i]=reg_num) then
+ begin
+  Exit(i+(e*reg_max));
+ end;
+
+ Assert(False);
+end;
+
+function t_context.get_offset(reg_mod:Word):Word;
+begin
+ if (reg_mod>=16) then
+ begin
+  Result:=reg_mod-16
+ end else
+ begin
+  Result:=reg_mod;
+ end;
+end;
+
+procedure t_context.load_from(reg_num:Word);
+var
+ r,g:Integer;
+begin
+ r:=reg_num mod 16;
+ r:=r mod reg_max;
+ g:=reg_num div reg_max;
+
+ if (regs_ids[r]<>reg_num) then
+ begin
+
+  Assert(last_grp<>g);
+
+  //prefetch group
+  _print_load_group(g*reg_max);
+
+  last_grp:=g;
+
+  {
+  Writeln(Fout,'vmovups ':18,reg_num*32:3,'(',reg_src,')',', ',('%ymm'+IntToStr(r)):0,' //ymm',r,'=data[',reg_num,']');
+  regs_ids[r]:=reg_num;
+
+  if (reg_ext<>0) then
+  begin
+   Writeln(Fout,'vextractf128 $1, ':18,('%ymm'+IntToStr(r)):6,', %xmm',r+reg_max);
+  end;
+  }
+
+ end;
+end;
+
+procedure t_context.write_to(reg_num,bitcn:Word);
+var
+ i,r,g:Integer;
+ t:Boolean;
+begin
+ r:=reg_num mod 16;
+ r:=r mod reg_max;
+ g:=reg_num div reg_max;
+
+ //test
+ t:=True;
+ for i:=0 to reg_max-1 do
+ begin
+  t:=t and (regs_cnt[i]=256);
+
+  Assert(regs_cnt[i]<=256);
+ end;
+
+ if t then
+ begin
+  Assert(last_grp<>g);
+  last_grp:=g;
+  flush_write;
+ end;
+
+ if (regs_ids[r]=-1) then
+ begin
+  regs_ids[r]:=reg_num;
+ end;
+
+ Inc(regs_cnt[r],bitcn);
+end;
+
+procedure t_context.flush_write;
+var
+ r:Integer;
+begin
+ //combine ext
+ if (reg_ext<>0) then
+ For r:=0 to reg_max-1 do
+ begin
+  Writeln(Fout,'vinsertf128 $1, ':18,'%xmm',(r+reg_max),', ','%ymm',r,', ','%ymm',r); //
+ end;
+
+ //write to mem
+ For r:=0 to reg_max-1 do
+ begin
+  Writeln(Fout,'vmovups ':18,('%ymm'+IntToStr(r)):6,', ',regs_ids[r]*32:3,'(',reg_dst,')',' //data[',regs_ids[r],']=','ymm',r);
+
+  regs_ids[r]:=-1;
+  regs_cnt[r]:=0;
+ end;
+
+ flags:=0;
+end;
+
+procedure on_gen_1dThin_detile(const interval:tbit_interval;
+                               var c:t_context;
+                               var lea_used_y:t_lea_used_y
+                              );
+var
+ bytes_pos:Word;
+ reg_num:Word;
+ reg_mod:Word;
+ offset :Word;
+
+ dlt_x:Integer;
+ dlt_x_str:RawByteString;
+ dlt_y_str:RawByteString;
+begin
+
+ //print lea
+ lea_used_y._print_prepare_z(c.diff_z);
+ lea_used_y._print;
+ //print lea
+
+ Assert((interval.pos_i mod 8)=0);
+
+ bytes_pos:=interval.pos_i div 8;
+
+ reg_num:=bytes_pos div 32;
+ reg_mod:=bytes_pos mod 32;
+
+ c.init_load(interval.bitcn);
+
+ c.load_from(reg_num);
+ reg_num:=c.translate_reg(reg_num,reg_mod);
+ offset :=c.get_offset(reg_mod);
+
+ dlt_x:=(interval.srt_x)*c.bytes;
+
+ dlt_x_str:='';
+ if (dlt_x<>0) then
+ begin
+  dlt_x_str:=IntToStr(dlt_x);
+ end;
+
+ dlt_y_str:=lea_used_y.a_ofs[interval.y];
+
+ case interval.bitcn of
+   16:
+    begin
+
+     case reg_mod of
+       0,2,4,6,8,10,12,14:
+        begin
+         Writeln(Fout,'vpextrw ':13,('$'+IntToStr(offset div 2)):3,', ',('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+       16,18,20,22,24,26,28,30:
+        begin
+         Writeln(Fout,'vpextrw ':13,('$'+IntToStr(offset div 2)):3,', ',('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+       else
+         Assert(False);
+     end;
+
+    end;
+
+   32:
+    begin
+
+     case reg_mod of
+       0,4,8,12:
+        begin
+         Writeln(Fout,'vpextrd ':13,('$'+IntToStr(offset div 4)):3,', ',('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+       16,20,24,28:
+        begin
+         Writeln(Fout,'vpextrd ':13,('$'+IntToStr(offset div 4)):3,', ',('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+       else
+         Assert(False);
+     end;
+
+    end;
+
+   64:
+    begin
+
+     case reg_mod of
+       0:
+        begin
+         Writeln(Fout,'vmovq ':18,('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+       8:
+        begin
+         Writeln(Fout,'vpextrq $1, ':18,('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+      16:
+        begin
+         Writeln(Fout,'vmovq ':18,('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+      24:
+        begin
+         Writeln(Fout,'vpextrq $1, ':18,('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+        end;
+      else
+        Assert(False);
+     end;
+
+    end;
+  128:
+    begin
+
+     case reg_mod of
+      0:
+       begin
+        Writeln(Fout,'vmovups ':18,('%xmm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+       end;
+     16:
+       begin
+        Writeln(Fout,'vextractf128 $1, ':18,('%ymm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+       end;
+     else
+       Assert(False);
+     end;
+
+    end;
+
+  256:
+    begin
+     Assert(reg_mod=0);
+
+     if (reg_num<16) then
+     begin
+      Writeln(Fout,'vmovups ':18,('%ymm'+IntToStr(reg_num)):6,', ',dlt_x_str:2,dlt_y_str);
+     end else
+     begin
+      Writeln(Fout,'vmovups ':18,('%ymm'+IntToStr(reg_num-16)):6,', ',dlt_x_str:2,dlt_y_str);
+     end;
+
+    end;
+
+  else
+    Assert(False);
+ end;
+
+
+end;
+
+procedure on_gen_1dThin_tiling(const interval:tbit_interval;
+                               var c:t_context;
+                               var lea_used_y:t_lea_used_y
+                              );
+
+var
+ bytes_pos:Word;
+ reg_num:Word;
+ reg_mod:Word;
+ offset :Word;
+ dlt_x:Integer;
+ dlt_x_str:RawByteString;
+ dlt_y_str:RawByteString;
+begin
+
+ //print lea
+ lea_used_y._print_prepare_z(c.diff_z);
+ lea_used_y._print;
+ //print lea
+
+ Assert((interval.pos_i mod 8)=0);
+
+ bytes_pos:=interval.pos_i div 8;
+
+ reg_num:=bytes_pos div 32;
+ reg_mod:=bytes_pos mod 32;
+
+ c.init_write(interval.bitcn);
+
+ c.write_to(reg_num,interval.bitcn);
+ reg_num:=c.translate_reg(reg_num,reg_mod);
+ offset :=c.get_offset(reg_mod);
+
+ dlt_x:=(interval.srt_x)*c.bytes;
+
+ dlt_x_str:='';
+ if (dlt_x<>0) then
+ begin
+  dlt_x_str:=IntToStr(dlt_x);
+ end;
+
+ dlt_y_str:=lea_used_y.a_ofs[interval.y];
+
+ case interval.bitcn of
+   16:
+    begin
+
+     case reg_mod of
+       0,2,4,6,8,10,12,14:
+        begin
+         Writeln(Fout,'vpinsrw ':13,('$'+IntToStr(offset div 2)):3,', ',dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num,', ','%xmm',reg_num);
+        end;
+       16,18,20,22,24,26,28,30:
+        begin
+         Writeln(Fout,'vpinsrw ':13,('$'+IntToStr(offset div 2)):3,', ',dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num,', ','%xmm',reg_num);
+        end;
+       else
+         Assert(False);
+     end;
+
+    end;
+
+   32:
+    begin
+
+     case reg_mod of
+       0,4,8,12:
+        begin
+         Writeln(Fout,'vpinsrd ':13,('$'+IntToStr(offset div 4)):3,', ',dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num,', ','%xmm',reg_num);
+        end;
+       16,20,24,28:
+        begin
+         //reg_ext:=c.reg_count+reg_num;
+
+         Writeln(Fout,'vpinsrd ':13,('$'+IntToStr(offset div 4)):3,', ',dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num,', ','%xmm',reg_num);
+
+         //c.flags:=c.flags or (1 shl reg_ext);
+        end;
+       else
+         Assert(False);
+     end;
+
+    end;
+
+   64:
+    begin
+
+     case reg_mod of
+       0:
+        begin
+
+         if (c.flags and (1 shl reg_num))=0 then
+         begin
+          //only if first
+          Writeln(Fout,'vmovq ':18,dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num); //
+         end else
+         begin
+          Assert(False);
+         end;
+
+         c.flags:=c.flags or (1 shl reg_num);
+        end;
+       8:
+        begin
+         Writeln(Fout,'vpinsrq $1, ':18,dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num,', ','%xmm',reg_num); //
+
+         c.flags:=c.flags or (1 shl reg_num);
+        end;
+      16:
+        begin
+
+         if (c.flags and (1 shl reg_num))=0 then
+         begin
+          //only if first
+          Writeln(Fout,'vmovq ':18,dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num); //
+         end else
+         begin
+          Assert(False);
+         end;
+
+         c.flags:=c.flags or (1 shl reg_num);
+        end;
+      24:
+        begin
+         Writeln(Fout,'vpinsrq $1, ':18,dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num,', ','%xmm',reg_num); //
+
+         c.flags:=c.flags or (1 shl reg_num);
+        end;
+      else
+        Assert(False);
+     end;
+
+    end;
+  128:
+    begin
+
+     case reg_mod of
+      0:
+       begin
+
+        if (c.flags and (1 shl reg_num))=0 then
+        begin
+         //only if first
+         Writeln(Fout,'vmovups ':18,dlt_x_str:2,dlt_y_str,', ','%xmm',reg_num); //
+        end else
+        begin
+         Assert(False);
+        end;
+
+        c.flags:=c.flags or (1 shl reg_num);
+       end;
+     16:
+       begin
+        Writeln(Fout,'vinsertf128 $1, ':18,dlt_x_str:2,dlt_y_str,', ','%ymm',reg_num,', ','%ymm',reg_num); //
+
+        c.flags:=c.flags or (1 shl reg_num);
+       end;
+     else
+       Assert(False);
+     end;
+
+    end;
+
+  256:
+    begin
+     Assert(reg_mod=0);
+
+     if (reg_num<16) then
+     begin
+      Writeln(Fout,'vmovups ':18,dlt_x_str:2,dlt_y_str,', ','%ymm',reg_num); //
+     end else
+     begin
+      Writeln(Fout,'vmovups ':18,dlt_x_str:2,dlt_y_str,', ','%ymm',reg_num-16); //
+     end;
+
+    end;
+
+  else
+    Assert(False);
+ end;
+
+end;
+
+procedure detile_Thin_1dThin_8(dst,src:Pointer;pitch:QWORD); assembler; nostackframe; SysV_ABI_CDecl;
+asm
+              lea (%rdi,%rdx,2), %r8  //+2
+              lea (%rdi,%rdx,4), %r9  //+4
+              lea (%rdx,%rdx,2), %r10 //+3
+              lea (%rdi,%r10,2), %r10 //+6
+          vmovups   0(%rsi), %ymm0
+          vmovups  32(%rsi), %ymm1
+ vextractf128 $1,  %ymm0, %xmm2
+ vextractf128 $1,  %ymm1, %xmm3
+     vpextrw  $0,  %xmm0,   (%rdi)
+     vpextrw  $2,  %xmm0,  2(%rdi)
+     vpextrw  $0,  %xmm2,  4(%rdi)
+     vpextrw  $2,  %xmm2,  6(%rdi)
+     vpextrw  $1,  %xmm0,   (%rdi,%rdx)
+     vpextrw  $3,  %xmm0,  2(%rdi,%rdx)
+     vpextrw  $1,  %xmm2,  4(%rdi,%rdx)
+     vpextrw  $3,  %xmm2,  6(%rdi,%rdx)
+     vpextrw  $4,  %xmm0,   (%r8 )
+     vpextrw  $6,  %xmm0,  2(%r8 )
+     vpextrw  $4,  %xmm2,  4(%r8 )
+     vpextrw  $6,  %xmm2,  6(%r8 )
+     vpextrw  $5,  %xmm0,   (%r8 ,%rdx)
+     vpextrw  $7,  %xmm0,  2(%r8 ,%rdx)
+     vpextrw  $5,  %xmm2,  4(%r8 ,%rdx)
+     vpextrw  $7,  %xmm2,  6(%r8 ,%rdx)
+     vpextrw  $0,  %xmm1,   (%r9 )
+     vpextrw  $2,  %xmm1,  2(%r9 )
+     vpextrw  $0,  %xmm3,  4(%r9 )
+     vpextrw  $2,  %xmm3,  6(%r9 )
+     vpextrw  $1,  %xmm1,   (%r9 ,%rdx)
+     vpextrw  $3,  %xmm1,  2(%r9 ,%rdx)
+     vpextrw  $1,  %xmm3,  4(%r9 ,%rdx)
+     vpextrw  $3,  %xmm3,  6(%r9 ,%rdx)
+     vpextrw  $4,  %xmm1,   (%r10)
+     vpextrw  $6,  %xmm1,  2(%r10)
+     vpextrw  $4,  %xmm3,  4(%r10)
+     vpextrw  $6,  %xmm3,  6(%r10)
+     vpextrw  $5,  %xmm1,   (%r10,%rdx)
+     vpextrw  $7,  %xmm1,  2(%r10,%rdx)
+     vpextrw  $5,  %xmm3,  4(%r10,%rdx)
+     vpextrw  $7,  %xmm3,  6(%r10,%rdx)
+end;
+
+procedure tile_Thin_1dThin_8(dst,src:Pointer;pitch:QWORD); assembler; nostackframe; SysV_ABI_CDecl;
+asm
+              lea (%rsi,%rdx,2), %r8  //+2
+              lea (%rsi,%rdx,4), %r9  //+4
+              lea (%rdx,%rdx,2), %r10 //+3
+              lea (%rsi,%r10,2), %r10 //+6
+     vpinsrw  $0,   (%rsi), %xmm0, %xmm0
+     vpinsrw  $2,  2(%rsi), %xmm0, %xmm0
+     vpinsrw  $0,  4(%rsi), %xmm2, %xmm2
+     vpinsrw  $2,  6(%rsi), %xmm2, %xmm2
+     vpinsrw  $1,   (%rsi,%rdx), %xmm0, %xmm0
+     vpinsrw  $3,  2(%rsi,%rdx), %xmm0, %xmm0
+     vpinsrw  $1,  4(%rsi,%rdx), %xmm2, %xmm2
+     vpinsrw  $3,  6(%rsi,%rdx), %xmm2, %xmm2
+     vpinsrw  $4,   (%r8 ), %xmm0, %xmm0
+     vpinsrw  $6,  2(%r8 ), %xmm0, %xmm0
+     vpinsrw  $4,  4(%r8 ), %xmm2, %xmm2
+     vpinsrw  $6,  6(%r8 ), %xmm2, %xmm2
+     vpinsrw  $5,   (%r8 ,%rdx), %xmm0, %xmm0
+     vpinsrw  $7,  2(%r8 ,%rdx), %xmm0, %xmm0
+     vpinsrw  $5,  4(%r8 ,%rdx), %xmm2, %xmm2
+     vpinsrw  $7,  6(%r8 ,%rdx), %xmm2, %xmm2
+     vpinsrw  $0,   (%r9 ), %xmm1, %xmm1
+     vpinsrw  $2,  2(%r9 ), %xmm1, %xmm1
+     vpinsrw  $0,  4(%r9 ), %xmm3, %xmm3
+     vpinsrw  $2,  6(%r9 ), %xmm3, %xmm3
+     vpinsrw  $1,   (%r9 ,%rdx), %xmm1, %xmm1
+     vpinsrw  $3,  2(%r9 ,%rdx), %xmm1, %xmm1
+     vpinsrw  $1,  4(%r9 ,%rdx), %xmm3, %xmm3
+     vpinsrw  $3,  6(%r9 ,%rdx), %xmm3, %xmm3
+     vpinsrw  $4,   (%r10), %xmm1, %xmm1
+     vpinsrw  $6,  2(%r10), %xmm1, %xmm1
+     vpinsrw  $4,  4(%r10), %xmm3, %xmm3
+     vpinsrw  $6,  6(%r10), %xmm3, %xmm3
+     vpinsrw  $5,   (%r10,%rdx), %xmm1, %xmm1
+     vpinsrw  $7,  2(%r10,%rdx), %xmm1, %xmm1
+     vpinsrw  $5,  4(%r10,%rdx), %xmm3, %xmm3
+     vpinsrw  $7,  6(%r10,%rdx), %xmm3, %xmm3
+  vinsertf128 $1, %xmm2, %ymm0, %ymm0
+  vinsertf128 $1, %xmm3, %ymm1, %ymm1
+          vmovups  %ymm0,   0(%rdi)
+          vmovups  %ymm1,  32(%rdi)
+end;
+
+procedure detile_Thin_1dThin_16(dst,src:Pointer;pitch:QWORD); assembler; nostackframe; SysV_ABI_CDecl;
+asm
+              lea (%rdi,%rdx,2), %r8  //+2
+              lea (%rdi,%rdx,4), %r9  //+4
+              lea (%rdx,%rdx,2), %r10 //+3
+              lea (%rdi,%r10,2), %r10 //+6
+          vmovups   0(%rsi), %ymm0
+          vmovups  32(%rsi), %ymm1
+          vmovups  64(%rsi), %ymm2
+          vmovups  96(%rsi), %ymm3
+ vextractf128 $1,  %ymm0, %xmm4
+ vextractf128 $1,  %ymm1, %xmm5
+ vextractf128 $1,  %ymm2, %xmm6
+ vextractf128 $1,  %ymm3, %xmm7
+     vpextrd  $0,  %xmm0,   (%rdi)
+     vpextrd  $2,  %xmm0,  4(%rdi)
+     vpextrd  $0,  %xmm1,  8(%rdi)
+     vpextrd  $2,  %xmm1, 12(%rdi)
+     vpextrd  $1,  %xmm0,   (%rdi,%rdx)
+     vpextrd  $3,  %xmm0,  4(%rdi,%rdx)
+     vpextrd  $1,  %xmm1,  8(%rdi,%rdx)
+     vpextrd  $3,  %xmm1, 12(%rdi,%rdx)
+     vpextrd  $0,  %xmm4,   (%r8 )
+     vpextrd  $2,  %xmm4,  4(%r8 )
+     vpextrd  $0,  %xmm5,  8(%r8 )
+     vpextrd  $2,  %xmm5, 12(%r8 )
+     vpextrd  $1,  %xmm4,   (%r8 ,%rdx)
+     vpextrd  $3,  %xmm4,  4(%r8 ,%rdx)
+     vpextrd  $1,  %xmm5,  8(%r8 ,%rdx)
+     vpextrd  $3,  %xmm5, 12(%r8 ,%rdx)
+     vpextrd  $0,  %xmm2,   (%r9 )
+     vpextrd  $2,  %xmm2,  4(%r9 )
+     vpextrd  $0,  %xmm3,  8(%r9 )
+     vpextrd  $2,  %xmm3, 12(%r9 )
+     vpextrd  $1,  %xmm2,   (%r9 ,%rdx)
+     vpextrd  $3,  %xmm2,  4(%r9 ,%rdx)
+     vpextrd  $1,  %xmm3,  8(%r9 ,%rdx)
+     vpextrd  $3,  %xmm3, 12(%r9 ,%rdx)
+     vpextrd  $0,  %xmm6,   (%r10)
+     vpextrd  $2,  %xmm6,  4(%r10)
+     vpextrd  $0,  %xmm7,  8(%r10)
+     vpextrd  $2,  %xmm7, 12(%r10)
+     vpextrd  $1,  %xmm6,   (%r10,%rdx)
+     vpextrd  $3,  %xmm6,  4(%r10,%rdx)
+     vpextrd  $1,  %xmm7,  8(%r10,%rdx)
+     vpextrd  $3,  %xmm7, 12(%r10,%rdx)
+end;
+
+procedure detile_Thin_1dThin_32(dst,src:Pointer;pitch:QWORD); assembler; nostackframe; SysV_ABI_CDecl;
+asm
+              lea (%rdi,%rdx,2), %r8  //+2
+              lea (%rdi,%rdx,4), %r9  //+4
+              lea (%rdx,%rdx,2), %r10 //+3
+              lea (%rdi,%r10,2), %r10 //+6
+          vmovups   0(%rsi), %ymm0
+          vmovups  32(%rsi), %ymm1
+          vmovups  64(%rsi), %ymm2
+          vmovups  96(%rsi), %ymm3
+          vmovups 128(%rsi), %ymm4
+          vmovups 160(%rsi), %ymm5
+          vmovups 192(%rsi), %ymm6
+          vmovups 224(%rsi), %ymm7
+ vextractf128 $1,  %ymm0, %xmm8
+ vextractf128 $1,  %ymm2, %xmm10
+ vextractf128 $1,  %ymm1, %xmm9
+ vextractf128 $1,  %ymm3, %xmm11
+ vextractf128 $1,  %ymm4, %xmm12
+ vextractf128 $1,  %ymm6, %xmm14
+ vextractf128 $1,  %ymm5, %xmm13
+ vextractf128 $1,  %ymm7, %xmm15
+            vmovq  %xmm0,   (%rdi)
+            vmovq  %xmm8,  8(%rdi)
+            vmovq  %xmm2, 16(%rdi)
+            vmovq %xmm10, 24(%rdi)
+            vmovq  %xmm1,   (%r8 )
+            vmovq  %xmm9,  8(%r8 )
+            vmovq  %xmm3, 16(%r8 )
+            vmovq %xmm11, 24(%r8 )
+            vmovq  %xmm4,   (%r9 )
+            vmovq %xmm12,  8(%r9 )
+            vmovq  %xmm6, 16(%r9 )
+            vmovq %xmm14, 24(%r9 )
+            vmovq  %xmm5,   (%r10)
+            vmovq %xmm13,  8(%r10)
+            vmovq  %xmm7, 16(%r10)
+            vmovq %xmm15, 24(%r10)
+      vpextrq $1,  %xmm0,   (%rdi,%rdx)
+      vpextrq $1,  %xmm8,  8(%rdi,%rdx)
+      vpextrq $1,  %xmm2, 16(%rdi,%rdx)
+      vpextrq $1, %xmm10, 24(%rdi,%rdx)
+      vpextrq $1,  %xmm1,   (%r8 ,%rdx)
+      vpextrq $1,  %xmm9,  8(%r8 ,%rdx)
+      vpextrq $1,  %xmm3, 16(%r8 ,%rdx)
+      vpextrq $1, %xmm11, 24(%r8 ,%rdx)
+      vpextrq $1,  %xmm4,   (%r9 ,%rdx)
+      vpextrq $1, %xmm12,  8(%r9 ,%rdx)
+      vpextrq $1,  %xmm6, 16(%r9 ,%rdx)
+      vpextrq $1, %xmm14, 24(%r9 ,%rdx)
+      vpextrq $1,  %xmm5,   (%r10,%rdx)
+      vpextrq $1, %xmm13,  8(%r10,%rdx)
+      vpextrq $1,  %xmm7, 16(%r10,%rdx)
+      vpextrq $1, %xmm15, 24(%r10,%rdx)
+end;
+
+procedure detile_Thin_1dThin_64(dst,src:Pointer;pitch:QWORD); assembler; nostackframe; SysV_ABI_CDecl;
+asm
+              lea (%rdi,%rdx,2), %r8  //+2
+              lea (%rdi,%rdx,4), %r9  //+4
+              lea (%rdx,%rdx,2), %r10 //+3
+              lea (%rdi,%r10,2), %r10 //+6
+          vmovups   0(%rsi), %ymm0
+          vmovups  32(%rsi), %ymm1
+          vmovups  64(%rsi), %ymm2
+          vmovups  96(%rsi), %ymm3
+          vmovups 128(%rsi), %ymm4
+          vmovups 160(%rsi), %ymm5
+          vmovups 192(%rsi), %ymm6
+          vmovups 224(%rsi), %ymm7
+          vmovups 256(%rsi), %ymm8
+          vmovups 288(%rsi), %ymm9
+          vmovups 320(%rsi), %ymm10
+          vmovups 352(%rsi), %ymm11
+          vmovups 384(%rsi), %ymm12
+          vmovups 416(%rsi), %ymm13
+          vmovups 448(%rsi), %ymm14
+          vmovups 480(%rsi), %ymm15
+          vmovups  %xmm0,   (%rdi)
+          vmovups  %xmm1, 16(%rdi)
+          vmovups  %xmm4, 32(%rdi)
+          vmovups  %xmm5, 48(%rdi)
+          vmovups  %xmm2,   (%r8 )
+          vmovups  %xmm3, 16(%r8 )
+          vmovups  %xmm6, 32(%r8 )
+          vmovups  %xmm7, 48(%r8 )
+          vmovups  %xmm8,   (%r9 )
+          vmovups  %xmm9, 16(%r9 )
+          vmovups %xmm12, 32(%r9 )
+          vmovups %xmm13, 48(%r9 )
+          vmovups %xmm10,   (%r10)
+          vmovups %xmm11, 16(%r10)
+          vmovups %xmm14, 32(%r10)
+          vmovups %xmm15, 48(%r10)
+ vextractf128 $1,  %ymm0,   (%rdi,%rdx)
+ vextractf128 $1,  %ymm1, 16(%rdi,%rdx)
+ vextractf128 $1,  %ymm4, 32(%rdi,%rdx)
+ vextractf128 $1,  %ymm5, 48(%rdi,%rdx)
+ vextractf128 $1,  %ymm2,   (%r8 ,%rdx)
+ vextractf128 $1,  %ymm3, 16(%r8 ,%rdx)
+ vextractf128 $1,  %ymm6, 32(%r8 ,%rdx)
+ vextractf128 $1,  %ymm7, 48(%r8 ,%rdx)
+ vextractf128 $1,  %ymm8,   (%r9 ,%rdx)
+ vextractf128 $1,  %ymm9, 16(%r9 ,%rdx)
+ vextractf128 $1, %ymm12, 32(%r9 ,%rdx)
+ vextractf128 $1, %ymm13, 48(%r9 ,%rdx)
+ vextractf128 $1, %ymm10,   (%r10,%rdx)
+ vextractf128 $1, %ymm11, 16(%r10,%rdx)
+ vextractf128 $1, %ymm14, 32(%r10,%rdx)
+ vextractf128 $1, %ymm15, 48(%r10,%rdx)
+end;
+
+procedure tile_Thin_1dThin_64(dst,src:Pointer;pitch:QWORD); assembler; nostackframe; SysV_ABI_CDecl;
+asm
+              lea (%rsi,%rdx,2), %r8  //+2
+              lea (%rsi,%rdx,4), %r9  //+4
+              lea (%rdx,%rdx,2), %r10 //+3
+              lea (%rsi,%r10,2), %r10 //+6
+          vmovups   (%rsi), %xmm0
+          vmovups 16(%rsi), %xmm1
+          vmovups 32(%rsi), %xmm4
+          vmovups 48(%rsi), %xmm5
+          vmovups   (%r8 ), %xmm2
+          vmovups 16(%r8 ), %xmm3
+          vmovups 32(%r8 ), %xmm6
+          vmovups 48(%r8 ), %xmm7
+          vmovups   (%r9 ), %xmm8
+          vmovups 16(%r9 ), %xmm9
+          vmovups 32(%r9 ), %xmm12
+          vmovups 48(%r9 ), %xmm13
+          vmovups   (%r10), %xmm10
+          vmovups 16(%r10), %xmm11
+          vmovups 32(%r10), %xmm14
+          vmovups 48(%r10), %xmm15
+  vinsertf128 $1,   (%rsi,%rdx), %ymm0, %ymm0
+  vinsertf128 $1, 16(%rsi,%rdx), %ymm1, %ymm1
+  vinsertf128 $1, 32(%rsi,%rdx), %ymm4, %ymm4
+  vinsertf128 $1, 48(%rsi,%rdx), %ymm5, %ymm5
+  vinsertf128 $1,   (%r8 ,%rdx), %ymm2, %ymm2
+  vinsertf128 $1, 16(%r8 ,%rdx), %ymm3, %ymm3
+  vinsertf128 $1, 32(%r8 ,%rdx), %ymm6, %ymm6
+  vinsertf128 $1, 48(%r8 ,%rdx), %ymm7, %ymm7
+  vinsertf128 $1,   (%r9 ,%rdx), %ymm8, %ymm8
+  vinsertf128 $1, 16(%r9 ,%rdx), %ymm9, %ymm9
+  vinsertf128 $1, 32(%r9 ,%rdx), %ymm12, %ymm12
+  vinsertf128 $1, 48(%r9 ,%rdx), %ymm13, %ymm13
+  vinsertf128 $1,   (%r10,%rdx), %ymm10, %ymm10
+  vinsertf128 $1, 16(%r10,%rdx), %ymm11, %ymm11
+  vinsertf128 $1, 32(%r10,%rdx), %ymm14, %ymm14
+  vinsertf128 $1, 48(%r10,%rdx), %ymm15, %ymm15
+          vmovups  %ymm0,   0(%rdi)
+          vmovups  %ymm1,  32(%rdi)
+          vmovups  %ymm2,  64(%rdi)
+          vmovups  %ymm3,  96(%rdi)
+          vmovups  %ymm4, 128(%rdi)
+          vmovups  %ymm5, 160(%rdi)
+          vmovups  %ymm6, 192(%rdi)
+          vmovups  %ymm7, 224(%rdi)
+          vmovups  %ymm8, 256(%rdi)
+          vmovups  %ymm9, 288(%rdi)
+          vmovups %ymm10, 320(%rdi)
+          vmovups %ymm11, 352(%rdi)
+          vmovups %ymm12, 384(%rdi)
+          vmovups %ymm13, 416(%rdi)
+          vmovups %ymm14, 448(%rdi)
+          vmovups %ymm15, 480(%rdi)
+end;
+
+{
+const
+ kMicroTileWidth =8;
+ kMicroTileHeight=8;
+
+{
+type
+ Tiler1d=object
+  m_linearWidth :DWORD;
+  m_linearHeight:DWORD;
+  m_linearDepth :DWORD;
+  m_paddedWidth :DWORD;
+  m_paddedHeight:DWORD;
+ end;
+ }
+
+{$OPTIMIZATION REGVAR,PEEPHOLE,CSE,NODEADSTORE}
+
+generic Procedure copy_linear_to_1dThin_AVX<T>(dst,src:Pointer;
+                                               m_linearWidth,
+                                               m_linearHeight,
+                                               m_linearDepth,
+                                               m_paddedWidth,
+                                               m_paddedHeight:DWORD); SysV_ABI_CDecl;
+var
+ m_pitch_bytes:QWORD;
+ x,y,z        :DWORD;
+begin
+
+ m_pitch_bytes :=(m_linearWidth)*T.m_bytePerElement;
+
+ m_paddedWidth :=((m_paddedWidth  - m_linearWidth ) div kMicroTileWidth) * (kMicroTileWidth * kMicroTileHeight * T.m_bytePerElement); //m_tileBytes
+ m_paddedHeight:=(m_paddedHeight - m_linearHeight)*m_pitch_bytes;
+
+ m_linearWidth :=(m_linearWidth  div kMicroTileWidth );
+ m_linearHeight:=(m_linearHeight div kMicroTileHeight);
+
+ z:=m_linearDepth;
+ repeat
+
+  y:=m_linearHeight;
+  repeat
+
+   x:=m_linearWidth;
+   repeat
+    T.m_cbs(dst,src,m_pitch_bytes);
+
+    src:=src+(kMicroTileWidth * T.m_bytePerElement); //m_tileRowBytes
+    dst:=dst+(kMicroTileWidth * kMicroTileHeight * T.m_bytePerElement); //m_tileBytes
+
+    Dec(x);
+   until (x=0);
+
+   src:=src+m_pitch_bytes*7;
+   dst:=dst+m_paddedWidth;
+
+   Dec(y);
+  until (y=0);
+
+  dst:=dst+m_paddedHeight;
+
+  Dec(z);
+ until (z=0);
+end;
+
+type
+ t_tile_avx_cb=procedure(dst,src:Pointer;pitch:QWORD); SysV_ABI_CDecl;
+
+ t_tile_Thin_1dThin_64=object
+  const
+   m_bytePerElement=8;
+   m_cbs:t_tile_avx_cb=@tile_Thin_1dThin_64;
+ end;
+
+procedure test_data;
+var
+ i,x,y,t:Byte;
+ data_src_8:array[0..63] of Byte;
+ data_dst_8:array[0..63] of Byte;
+
+ data_src_16:array[0..63] of WORD;
+ data_dst_16:array[0..63] of WORD;
+
+ data_src_32:array[0..63] of DWORD;
+ data_dst_32:array[0..63] of DWORD;
+
+ data_src_64:array[0..63] of QWORD;
+ data_dst_64:array[0..63] of QWORD;
+
+ ftime:QWORD;
+
+ src,dst:Pointer;
+begin
+ i:=0;
+ for y:=0 to 7 do
+ for x:=0 to 7 do
+ begin
+  t:=_getElementIndex(x,y,0,8,kMicroTileModeThin,kArrayMode1dTiledThin);
+  data_src_8[t]:=i;
+
+  t:=_getElementIndex(x,y,0,16,kMicroTileModeThin,kArrayMode1dTiledThin);
+  data_src_16[t]:=i;
+
+  t:=_getElementIndex(x,y,0,32,kMicroTileModeThin,kArrayMode1dTiledThin);
+  data_src_32[t]:=i;
+
+  t:=_getElementIndex(x,y,0,64,kMicroTileModeThin,kArrayMode1dTiledThin);
+  data_src_64[t]:=i;
+
+  i:=i+1;
+ end;
+
+ FillChar(data_dst_16,sizeof(data_dst_16),0);
+
+ detile_Thin_1dThin_16(@data_dst_16,@data_src_16,8*2);
+
+ FillChar(data_dst_32,sizeof(data_dst_32),0);
+
+ detile_Thin_1dThin_32(@data_dst_32,@data_src_32,8*4);
+
+
+ FillChar(data_dst_64,sizeof(data_dst_32),0);
+
+ detile_Thin_1dThin_64(@data_dst_64,@data_src_64,8*8);
+
+ {
+ FillChar(data_dst_8,64,0);
+
+ detile_Thin_1dThin_8(@data_dst_8,@data_src_8,8);
+
+ FillChar(data_src_8,64,0);
+
+ tile_Thin_1dThin_8(@data_src_8,@data_dst_8,8);
+
+ FillChar(data_dst_8,64,0);
+
+ detile_Thin_1dThin_8(@data_dst_8,@data_src_8,8);
+ }
+
+ src:=GetMem(1920*1080*8);
+ dst:=GetMem(1920*1080*8);
+
+ ftime:=GetTickCount64;
+
+ specialize copy_linear_to_1dThin_AVX<t_tile_Thin_1dThin_64>(dst,src,1920,1080,1,1920,1080);
+
+ writeln(GetTickCount64-ftime);
+
+ writeln;
+end;
+}
+
+function get_asm_name(mode:t_1d_mode;is_tile2linear:Boolean;bits:Byte):RawByteString;
+begin
+ Result:=linear2tile_tile2linear[is_tile2linear]+
+         '_'+Thin_Display_Thick[mode]+
+         '1d_'+IntToStr(bits);
+end;
+
+Procedure generate_1dThin_asm(mode:t_1d_mode);
+var
+ b,bits:Byte;
+ all:Word;
+
+ i:Byte;
+ reg_count:Word;
+
+ c:t_context;
+
+ lea_used_y:t_lea_used_y;
+
+ prev_z:Integer;
+begin
+ //sort all
+  For b:=ord(b8) to getLastBit(mode) do
+  begin
+   with g_axis_intervals[t_bits_per_element(b)] do
+   begin
+    Sort_xyz;
+   end;
+  end;
+ //sort all
+
+ For b:=ord(b8) to getLastBit(mode) do
+ begin
+  c.reset();
+
+  c.bytes:=(1 shl b);
+  bits:=c.bytes shl 3;
+  all:=c.bytes*64*getThick(mode);
+  Writeln('//[',bits,']:all=',all,'bytes');
+
+  //rdi(dst),rsi(src),rdx(dst_pitch)
+
+  Writeln(Fout);
+  Writeln(Fout,'procedure ',get_asm_name(mode,True,bits),'(dst,src:Pointer;pitch,slice:QWORD); SysV_ABI_CDecl; assembler; nostackframe;');
+  Writeln(Fout,'asm');
+
+  //build lea
+  lea_used_y._init(g_axis_intervals[t_bits_per_element(b)]);
+  lea_used_y._build_str(reg_dst);
+  //build lea
+
+  //load to regs
+  reg_count:=all div 32;
+
+  with g_axis_intervals[t_bits_per_element(b)] do
+  begin
+
+   c.reg_count:=reg_count;
+
+   prev_z:=intervals[0].z;
+
+   For i:=0 to num_i-1 do
+   begin
+    c.diff_z:=intervals[i].z-prev_z;
+    prev_z:=intervals[i].z;
+
+    on_gen_1dThin_detile(intervals[i],
+                         c,
+                         lea_used_y
+                        );
+
+    //Writeln(intervals[i].pos_i div 8:4,'->',intervals[i].srt_x,'..',intervals[i].end_x,':',intervals[i].y,':',intervals[i].z,':',intervals[i].bitcn,'bit ');
+
+   end;
+
+   //
+  end; //with
+
+
+  Writeln(Fout,'end;');
+  //<-detiling
+
+  //tiling->
+
+  //rdi(src),rsi(dst),rdx(dst_pitch)
+
+  Writeln(Fout);
+  Writeln(Fout,'procedure ',get_asm_name(mode,False,bits),'(dst,src:Pointer;pitch,slice:QWORD); SysV_ABI_CDecl; assembler; nostackframe;');
+
+  Writeln(Fout,'asm');
+
+  c.reset;
+
+  //build lea
+  lea_used_y._init(g_axis_intervals[t_bits_per_element(b)]);
+  lea_used_y._build_str(reg_src);
+  //build lea
+
+  with g_axis_intervals[t_bits_per_element(b)] do
+  begin
+
+   c.reg_count:=reg_count;
+
+   prev_z:=intervals[0].z;
+
+   For i:=0 to num_i-1 do
+   begin
+    c.diff_z:=intervals[i].z-prev_z;
+    prev_z:=intervals[i].z;
+
+    on_gen_1dThin_tiling(intervals[i],
+                         c,
+                         lea_used_y
+                        );
+   end;
+
+   c.flush_write;
+
+  end; //with
+
+  Writeln(Fout,'end;');
+  //<-tiling
+
+
+ end; //For b
+
+end;
+
+function get_copy_name(mode:t_1d_mode;is_tile2linear:Boolean;bits:Byte):RawByteString;
+begin
+ Result:='copy_'+linear2tile_tile2linear[is_tile2linear]+
+         '_'+Thin_Display_Thick[mode]+
+         '1d_'+IntToStr(bits);
+end;
+
+function get_copy_array_name(mode:t_1d_mode;is_tile2linear:Boolean):RawByteString;
+begin
+ Result:='copy_array_'+linear2tile_tile2linear[is_tile2linear]+
+         '_'+Thin_Display_Thick[mode]+
+         '1d';
+end;
+
+Procedure generate_copy_array_1d(mode:t_1d_mode;is_tile2linear:Boolean);
+var
+ b,bits:Byte;
+ bytes:Byte;
+
+begin
+ Writeln(Fout,'');
+ Writeln(Fout,'const');
+
+ Writeln(Fout,' ',get_copy_array_name(mode,is_tile2linear),':array[0..',IntToStr(ord(b128)-ord(b8)),'] of t_copy_cbs=(');
+
+ For b:=ord(b8) to ord(b128) do
+ begin
+  bytes:=(1 shl b);
+  bits :=bytes shl 3;
+
+  Write(Fout,'  ');
+
+  if b>getLastBit(mode) then
+  begin
+   Write(Fout,'nil');
+  end else
+  begin
+   Write(Fout,'@',get_copy_name(mode,is_tile2linear,bits));
+  end;
+
+  if (b<>ord(b128)) then
+  begin
+   Write(Fout,',');
+  end;
+  Writeln(Fout,'');
+
+ end;
+
+ Writeln(Fout,' ',');');
+end;
+
+Procedure generate_copy_1d(mode:t_1d_mode;is_tile2linear,is_header:Boolean);
+var
+ b,bits:Byte;
+ bytes:Byte;
+
+begin
+ For b:=ord(b8) to getLastBit(mode) do
+ begin
+  bytes:=(1 shl b);
+  bits :=bytes shl 3;
+
+  Writeln(Fout);
+  Writeln(Fout,'procedure ',get_copy_name(mode,is_tile2linear,bits),
+               '('               +#13#10+space(2)+
+               'dst,src:Pointer;'+#13#10+space(2)+
+               'm_linearWidth,'  +#13#10+space(2)+
+               'm_linearHeight,' +#13#10+space(2)+
+               'm_linearDepth,'  +#13#10+space(2)+
+               'm_paddedWidth,'  +#13#10+space(2)+
+               'm_paddedHeight'+
+               ':DWORD'+
+               '); SysV_ABI_CDecl;');
+
+  if is_header then Continue;
+
+  Writeln(Fout,'const');
+  Writeln(Fout,' kMicroTileWidth =8;');
+  Writeln(Fout,' kMicroTileHeight=8;');
+  Writeln(Fout,' m_bytePerElement=',bytes,';');
+  Writeln(Fout,' m_thick=',getThick(mode),';');
+
+  if (mode<>mThick) then
+  begin
+  Writeln(Fout,' m_slice_bytes=0;');
+  end;
+
+  Writeln(Fout,'var');
+  Writeln(Fout,' m_pitch_bytes:QWORD;');
+
+  if (mode=mThick) then
+  begin
+  Writeln(Fout,' m_slice_bytes:QWORD;');
+  end;
+
+  Writeln(Fout,' x,y,z        :DWORD;');
+  Writeln(Fout,'begin');
+  Writeln(Fout,'');
+  Writeln(Fout,' m_pitch_bytes :=(m_linearWidth)*m_bytePerElement;');
+
+  if (mode=mThick) then
+  begin
+  Writeln(Fout,' m_slice_bytes :=(m_linearWidth*m_linearHeight)*m_bytePerElement;');
+  end;
+
+  Writeln(Fout,'');
+  Writeln(Fout,' m_paddedWidth :=(m_paddedWidth  - m_linearWidth )*(kMicroTileHeight * m_bytePerElement);');
+  Writeln(Fout,' m_paddedHeight:=(m_paddedHeight - m_linearHeight)*m_pitch_bytes;');
+  Writeln(Fout,'');
+  Writeln(Fout,' m_linearWidth :=(m_linearWidth  div kMicroTileWidth );');
+  Writeln(Fout,' m_linearHeight:=(m_linearHeight div kMicroTileHeight);');
+  Writeln(Fout,'');
+  Writeln(Fout,' z:=m_linearDepth;');
+  Writeln(Fout,' repeat');
+  Writeln(Fout,'');
+  Writeln(Fout,'  y:=m_linearHeight;');
+  Writeln(Fout,'  repeat');
+  Writeln(Fout,'');
+  Writeln(Fout,'   x:=m_linearWidth;');
+  Writeln(Fout,'   repeat');
+  Writeln(Fout,'    ',get_asm_name(mode,is_tile2linear,bits),'(dst,src,m_pitch_bytes,m_slice_bytes);');
+  Writeln(Fout,'');
+
+  if is_tile2linear then
+  begin
+   Writeln(Fout,'    src:=src+(kMicroTileWidth * kMicroTileHeight * m_bytePerElement);');
+   Writeln(Fout,'    dst:=dst+(kMicroTileWidth * m_bytePerElement);');
+  end else
+  begin
+   Writeln(Fout,'    src:=src+(kMicroTileWidth * m_bytePerElement);');
+   Writeln(Fout,'    dst:=dst+(kMicroTileWidth * kMicroTileHeight * m_bytePerElement);');
+  end;
+
+  Writeln(Fout,'');
+  Writeln(Fout,'    Dec(x);');
+  Writeln(Fout,'   until (x=0);');
+  Writeln(Fout,'');
+
+  if is_tile2linear then
+  begin
+   Writeln(Fout,'   src:=src+m_paddedWidth;');
+   Writeln(Fout,'   dst:=dst+m_pitch_bytes*7;');
+  end else
+  begin
+   Writeln(Fout,'   src:=src+m_pitch_bytes*7;');
+   Writeln(Fout,'   dst:=dst+m_paddedWidth;');
+  end;
+
+  Writeln(Fout,'');
+  Writeln(Fout,'   Dec(y);');
+  Writeln(Fout,'  until (y=0);');
+  Writeln(Fout,'');
+
+  if is_tile2linear then
+  begin
+   Writeln(Fout,'  src:=src+m_paddedHeight;');
+   Writeln(Fout,'  dst:=dst+m_slice_bytes*3;');
+  end else
+  begin
+   Writeln(Fout,'  dst:=dst+m_paddedHeight;');
+   Writeln(Fout,'  src:=src+m_slice_bytes*3;');
+  end;
+
+  Writeln(Fout,'');
+  Writeln(Fout,'  Dec(z,m_thick);');
+  Writeln(Fout,' until (z=0);');
+  Writeln(Fout,'end;');
+
+ end;
+
+end;
+
+var
+ g_bits_pos  :Byte=0;
+ g_bits_stack:array[0..5] of t_bits;
+
+procedure push_bits;
+begin
+ g_bits_stack[g_bits_pos]:=g_bits;
+ g_bits_pos:=g_bits_pos+1;
+end;
+
+procedure pop_bits;
+begin
+ g_bits_pos:=g_bits_pos-1;
+ g_bits:=g_bits_stack[g_bits_pos];
+end;
+
+begin
+ DefaultSystemCodePage:=CP_UTF8;
+ DefaultUnicodeCodePage:=CP_UTF8;
+ DefaultFileSystemCodePage:=CP_UTF8;
+ DefaultRTLFileSystemCodePage:=CP_UTF8;
+ UTF8CompareLocale:=CP_UTF8;
+
+ set_arm([]);
+ set_mtm([kMicroTileModeDisplay]);
+ set_bpe([b8]);
+  begin
+   push_bits;
+
+    set_elm(m_x,0,$1,0);
+    set_elm(m_x,1,$1,1);
+    set_elm(m_x,2,$1,2);
+    set_elm(m_y,1,$1,3);
+    set_elm(m_y,0,$1,4);
+    set_elm(m_y,2,$1,5);
+
+   mark_end;
+   pop_bits;
+  end;
+ set_bpe([b16]);
+  begin
+   push_bits;
+
+    set_elm(m_x,0,$1,0);
+    set_elm(m_x,1,$1,1);
+    set_elm(m_x,2,$1,2);
+    set_elm(m_y,0,$1,3);
+    set_elm(m_y,1,$1,4);
+    set_elm(m_y,2,$1,5);
+
+   mark_end;
+   pop_bits;
+  end;
+ set_bpe([b32]);
+  begin
+   push_bits;
+
+    set_elm(m_x,0,$1,0);
+    set_elm(m_x,1,$1,1);
+    set_elm(m_y,0,$1,2);
+    set_elm(m_x,2,$1,3);
+    set_elm(m_y,1,$1,4);
+    set_elm(m_y,2,$1,5);
+
+   mark_end;
+   pop_bits;
+  end;
+ set_bpe([b64]);
+  begin
+   push_bits;
+
+    set_elm(m_x,0,$1,0);
+    set_elm(m_y,0,$1,1);
+    set_elm(m_x,1,$1,2);
+    set_elm(m_x,2,$1,3);
+    set_elm(m_y,1,$1,4);
+    set_elm(m_y,2,$1,5);
+
+   mark_end;
+   pop_bits;
+  end;
+
+  set_arm([]);
+  set_bpe([]);
+
+  set_mtm([kMicroTileModeThin,kMicroTileModeDepth]);
+    begin
+     push_bits;
+
+      set_elm(m_x,0,$1,0);
+      set_elm(m_y,0,$1,1);
+      set_elm(m_x,1,$1,2);
+      set_elm(m_y,1,$1,3);
+      set_elm(m_x,2,$1,4);
+      set_elm(m_y,2,$1,5);
+      //
+      mark_end;
+
+      set_arm([kArrayMode2dTiledXThick,kArrayMode3dTiledXThick]);
+      begin
+       push_bits;
+
+        set_elm(m_z,2,$1,8);
+
+       mark_end;
+       pop_bits;
+      end;
+      //
+
+      set_arm([
+       kArrayMode1dTiledThick,
+       kArrayMode2dTiledThick,
+       kArrayMode3dTiledThick,
+       kArrayModeTiledThickPrt,
+       kArrayMode2dTiledThickPrt,
+       kArrayMode3dTiledThickPrt
+      ]);
+
+      begin
+       push_bits;
+
+        set_elm(m_z,0,$1,6);
+        set_elm(m_z,1,$1,7);
+
+       mark_end;
+       pop_bits;
+      end;
+
+     //
+     pop_bits;
+    end;
+
+  set_arm([]);
+  set_bpe([]);
+
+  set_mtm([kMicroTileModeThick]);
+  begin
+   //
+    set_arm([
+     kArrayMode2dTiledXThick,
+     kArrayMode3dTiledXThick
+    ]);
+    begin
+     push_bits;
+
+      set_elm(m_z,2,$1,8);
+
+     mark_end;
+     pop_bits;
+    end;
+
+    set_arm([
+     kArrayMode1dTiledThick,
+     kArrayMode2dTiledThick,
+     kArrayMode3dTiledThick,
+     kArrayModeTiledThickPrt,
+     kArrayMode2dTiledThickPrt,
+     kArrayMode3dTiledThickPrt
+    ]);
+
+    set_bpe([b8,b16]);
+      begin
+       push_bits;
+
+        set_elm(m_x,0,$1,0);
+        set_elm(m_y,0,$1,1);
+        set_elm(m_x,1,$1,2);
+        set_elm(m_y,1,$1,3);
+        set_elm(m_z,0,$1,4);
+        set_elm(m_z,1,$1,5);
+        set_elm(m_x,2,$1,6);
+        set_elm(m_y,2,$1,7);
+
+       mark_end;
+       pop_bits;
+      end;
+    set_bpe([b32]);
+      begin
+       push_bits;
+
+        set_elm(m_x,0,$1,0);
+        set_elm(m_y,0,$1,1);
+        set_elm(m_x,1,$1,2);
+        set_elm(m_z,0,$1,3);
+        set_elm(m_y,1,$1,4);
+        set_elm(m_z,1,$1,5);
+        set_elm(m_x,2,$1,6);
+        set_elm(m_y,2,$1,7);
+
+       mark_end;
+       pop_bits;
+      end;
+    set_bpe([b64,b128]);
+      begin
+       push_bits;
+
+        set_elm(m_x,0,$1,0);
+        set_elm(m_y,0,$1,1);
+        set_elm(m_z,0,$1,2);
+        set_elm(m_x,1,$1,3);
+        set_elm(m_y,1,$1,4);
+        set_elm(m_z,1,$1,5);
+        set_elm(m_x,2,$1,6);
+        set_elm(m_y,2,$1,7);
+
+       mark_end;
+       pop_bits;
+      end;
+
+  end;
+
+  Assign (Fout,'tiling_avx.pas');
+  rewrite(Fout);
+
+  Writeln(Fout,'{This file is automatically generated by "tiling_rebuild"}');
+  Writeln(Fout,'unit tiling_avx;');
+  Writeln(Fout,'');
+  Writeln(Fout,'{$mode objfpc}{$H+}');
+  Writeln(Fout,'{$OPTIMIZATION REGVAR,PEEPHOLE,CSE,NODEADSTORE}');
+  Writeln(Fout,'');
+  Writeln(Fout,'interface');
+
+  Writeln(Fout,'');
+
+  Writeln(Fout,'{');
+  Writeln(Fout,'Linear dimensions must be aligned:');
+  Writeln(Fout,' 8x8   pixels for 1dThin');
+  Writeln(Fout,' 8x8x4 pixels for 1dThick');
+  Writeln(Fout,'}');
+
+  Writeln(Fout,'');
+  Writeln(Fout,'type');
+
+  Writeln(Fout,' t_copy_cbs=procedure'+
+               '('               +#13#10+space(2)+
+               'dst,src:Pointer;'+#13#10+space(2)+
+               'm_linearWidth,'  +#13#10+space(2)+
+               'm_linearHeight,' +#13#10+space(2)+
+               'm_linearDepth,'  +#13#10+space(2)+
+               'm_paddedWidth,'  +#13#10+space(2)+
+               'm_paddedHeight'+
+               ':DWORD'+
+               '); SysV_ABI_CDecl;');
+
+  generate_copy_1d(mDisplay,True ,True);
+  generate_copy_1d(mDisplay,False,True);
+
+  generate_copy_1d(mThin,True ,True);
+  generate_copy_1d(mThin,False,True);
+
+  generate_copy_1d(mThick,True ,True);
+  generate_copy_1d(mThick,False,True);
+
+  //
+
+  generate_copy_array_1d(mDisplay,True );
+  generate_copy_array_1d(mDisplay,False);
+
+  generate_copy_array_1d(mThin,True );
+  generate_copy_array_1d(mThin,False);
+
+  generate_copy_array_1d(mThick,True );
+  generate_copy_array_1d(mThick,False);
+
+  //
+
+  Writeln(Fout,'');
+  Writeln(Fout,'implementation');
+  Writeln(Fout,'');
+
+  Iterate_Axiss_1dThin(mDisplay);
+  generate_1dThin_asm (mDisplay);
+
+  Iterate_Axiss_1dThin(mThin);
+  generate_1dThin_asm (mThin);
+
+  Iterate_Axiss_1dThin(mThick);
+  generate_1dThin_asm (mThick);
+
+  generate_copy_1d(mDisplay,True ,False);
+  generate_copy_1d(mDisplay,False,False);
+
+  generate_copy_1d(mThin,True ,False);
+  generate_copy_1d(mThin,False,False);
+
+  generate_copy_1d(mThick,True ,False);
+  generate_copy_1d(mThick,False,False);
+
+  Writeln(Fout,'');
+  Writeln(Fout,'end.');
+  Writeln(Fout,'');
+
+  Close(Fout);
+
+  //test_data;
+
+ readln;
+end.
+

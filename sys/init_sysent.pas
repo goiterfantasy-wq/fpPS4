@@ -10,10 +10,12 @@ interface
 uses
  sysent,
  machdep,
+ vfs_aio,
  vm_mmap,
  kern_evf,
  kern_gpo,
  kern_sig,
+ vfs_aio2,
  kern_bnet,
  kern_dmem,
  kern_exec,
@@ -1334,12 +1336,12 @@ var
   ),
   (//[255]
      sy_narg:1;
-     sy_call:nil;
+     sy_call:@sys_aio_read;
      sy_name:'sys_aio_read'
   ),
   (//[256]
      sy_narg:1;
-     sy_call:nil;
+     sy_call:@sys_aio_write;
      sy_name:'sys_aio_write'
   ),
   (//[257]
@@ -1629,22 +1631,22 @@ var
   ),
   (//[314]
      sy_narg:1;
-     sy_call:nil;
+     sy_call:@sys_aio_return;
      sy_name:'sys_aio_return'
   ),
   (//[315]
      sy_narg:3;
-     sy_call:nil;
+     sy_call:@sys_aio_suspend;
      sy_name:'sys_aio_suspend'
   ),
   (//[316]
      sy_narg:2;
-     sy_call:nil;
+     sy_call:@sys_aio_cancel;
      sy_name:'sys_aio_cancel'
   ),
   (//[317]
      sy_narg:1;
-     sy_call:nil;
+     sy_call:@sys_aio_error;
      sy_name:'sys_aio_error'
   ),
   (//[318]
@@ -1854,7 +1856,7 @@ var
   ),
   (//[359]
      sy_narg:2;
-     sy_call:nil;
+     sy_call:@sys_aio_waitcomplete;
      sy_name:'sys_aio_waitcomplete'
   ),
   (//[360]
@@ -2384,7 +2386,7 @@ var
   ),
   (//[465]
      sy_narg:2;
-     sy_call:nil;
+     sy_call:@sys_aio_fsync;
      sy_name:'sys_aio_fsync'
   ),
   (//[466]
@@ -3329,12 +3331,12 @@ var
   ),
   (//[654]
      sy_narg:5;
-     sy_call:nil;
+     sy_call:@sys_blockpool_map;
      sy_name:'sys_blockpool_map'
   ),
   (//[655]
      sy_narg:3;
-     sy_call:nil;
+     sy_call:@sys_blockpool_unmap;
      sy_name:'sys_blockpool_unmap'
   ),
   (//[656]
@@ -3409,7 +3411,7 @@ var
   ),
   (//[670]
      sy_narg:4;
-     sy_call:nil;
+     sy_call:@sys_aio_init;
      sy_name:'sys_aio_init'
   ),
   (//[671]

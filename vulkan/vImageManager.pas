@@ -1115,10 +1115,14 @@ begin
  Result:=True;
 end;
 
+const
+ C_BN:array[0..1] of Char = ('b','n');
+
 procedure _SetName(t:TvCustomImage2);
 var
  ch:Char;
 begin
+ if (t=nil) then Exit;
 
  Case t.key.cformat of
   //stencil
@@ -1142,21 +1146,16 @@ begin
    end;
   else
    begin
-    if (t.key.params.arrayLayers>1) then
-    begin
-     Ch:='A';
-    end else
-    begin
-     Ch:='I';
-    end;
+    Ch:='I';
    end;
  end;
 
  t.SetObjectName(Ch+'_0x'+HexStr(QWORD(t.key.Addr),10)+
+                      '_'+GetVkFormatStr(t.key.cformat)+
                       '_'+IntToStr(t.key.params.width)+'x'+IntToStr(t.key.params.height)+'x'+IntToStr(t.key.params.depth)+
                      '_m'+IntToStr(t.key.params.mipLevels)+
                      '_a'+IntToStr(t.key.params.arrayLayers)+
-                     '_t'+IntToStr(t.key.params.tiling.idx)+'|'+IntToStr(t.key.params.tiling.alt)
+                     '_t'+IntToStr(t.key.params.tiling.idx)+C_BN[t.key.params.tiling.alt]
                 );
 
 end;
@@ -1228,6 +1227,8 @@ begin
   begin
 
    _SetName(t);
+   _SetName(t.DepthOnly  );
+   _SetName(t.StencilOnly);
 
    req:=t.GetRequirements;
 

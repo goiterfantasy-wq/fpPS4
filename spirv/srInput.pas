@@ -63,7 +63,11 @@ type
   itSubgroupLocalInvocationId,
 
   itPositions,
-  itParameters
+  itParameters,
+
+  itBaseVertex,
+  itBaseInstance,
+  itDrawIndex
  );
 
  PsrInputKey=^TsrInputKey;
@@ -242,8 +246,10 @@ end;
 
 procedure TsrInputList.AllocBinding;
 var
- pDecorateList:TsrDecorateList;
+ pDecorateList  :TsrDecorateList;
  pCapabilityList:PsrCapabilityList;
+ pHeaderList    :TsrHeaderList;
+
  node:TsrInput;
  pVar:TsrVariable;
 
@@ -261,6 +267,7 @@ var
 begin
  pDecorateList  :=FEmit.GetDecorateList;
  pCapabilityList:=FEmit.GetCapabilityList;
+ pHeaderList    :=FEmit.GetHeaderList;
 
  node:=First;
  While (node<>nil) do
@@ -305,6 +312,7 @@ begin
       begin
        TestFlat;
        pDecorateList.OpDecorate(pVar,Decoration.BuiltIn,BuiltIn.SampleId);
+       pCapabilityList^.Add(Capability.SampleRateShading);
       end;
 
     itPerspSample,
@@ -319,6 +327,7 @@ begin
 
     itSubgroupLocalInvocationId:
       begin
+       TestFlat;
        pDecorateList.OpDecorate(pVar,Decoration.BuiltIn,BuiltIn.SubgroupLocalInvocationId);
       end;
 
@@ -332,9 +341,31 @@ begin
        pDecorateList.OpDecorate(pVar,Decoration.Location,node.key.typeid);
       end;
 
+    itBaseVertex:
+      begin
+       pDecorateList.OpDecorate(pVar,Decoration.BuiltIn,BuiltIn.BaseVertex);
+       pCapabilityList^.Add(Capability.DrawParameters);
+       pHeaderList.SPV_KHR_shader_draw_parameters;
+      end;
+
+    itBaseInstance:
+      begin
+       pDecorateList.OpDecorate(pVar,Decoration.BuiltIn,BuiltIn.BaseInstance);
+       pCapabilityList^.Add(Capability.DrawParameters);
+       pHeaderList.SPV_KHR_shader_draw_parameters;
+      end;
+
+    itDrawIndex:
+      begin
+       pDecorateList.OpDecorate(pVar,Decoration.BuiltIn,BuiltIn.DrawIndex);
+       pCapabilityList^.Add(Capability.DrawParameters);
+       pHeaderList.SPV_KHR_shader_draw_parameters;
+      end;
+
     else
      Assert(false,'AllocBinding:'+GetEnumName(TypeInfo(TpsslInputType),ord(node.key.itype)));
    end;
+
   end;
   node:=Next(node);
  end;

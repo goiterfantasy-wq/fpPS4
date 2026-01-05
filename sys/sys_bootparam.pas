@@ -17,6 +17,13 @@ var
  p_base_ps4_mode      :DWORD=1; //[0..1]
  p_neomode            :DWORD=0; //[0..1]
  p_cpumode            :DWORD=5; //NORMAL
+ p_openpsid           :array[0..15] of Byte;
+
+ //dipsw
+ p_isDevelopmentMode          :Byte=0;
+ p_isTestKit                  :Byte=0;
+ p_IsDisableRazor             :Byte=0;
+ p_IsDisableBinaryVersionCheck:Byte=0;
 
  p_is_fork            :Boolean=False;
  p_halt_on_exit       :Boolean=False;

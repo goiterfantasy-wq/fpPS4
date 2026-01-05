@@ -118,7 +118,16 @@ begin
   if (uio^.uio_td<>nil) then
   if ((tp^.t_flags and TF_THD_NAME_PREFIX)<>0) then
   begin
-   Result:=Result+strlen(@p_kthread(uio^.uio_td)^.td_name)+3;
+   with p_kthread(uio^.uio_td)^ do
+   begin
+    if td_name[0]=#0 then
+    begin
+     Result:=Result+8+3;
+    end else
+    begin
+     Result:=Result+strlen(@td_name)+3;
+    end;
+   end;
    if ((tp^.t_flags and TF_FIB_ADDR_PREFIX)<>0) then
    begin
     Result:=Result+4+10;
@@ -255,7 +264,17 @@ begin
   if ((tp^.t_flags and TF_THD_NAME_PREFIX)<>0) then
   begin
    WRITE('(');
-   WRITE(@p_kthread(uio^.uio_td)^.td_name,strlen(@p_kthread(uio^.uio_td)^.td_name));
+
+   with p_kthread(uio^.uio_td)^ do
+   begin
+    if td_name[0]=#0 then
+    begin
+     WRITE('#'+HexStr(td_tid,7));
+    end else
+    begin
+     WRITE(@p_kthread(uio^.uio_td)^.td_name,strlen(@td_name));
+    end;
+   end;
 
    if ((tp^.t_flags and TF_FIB_ADDR_PREFIX)<>0) then
    begin
@@ -305,6 +324,7 @@ end;
 function ttydisc_write(tp:p_tty;uio:p_uio;ioflag:Integer):Integer;
 var
  size:QWORD;
+ buf:Pointer;
 begin
  uio^.uio_td:=curkthread;
  size:=tty_get_full_size(tp,uio);
@@ -315,10 +335,9 @@ begin
    Result:=_ttydisc_write0(tp,uio);
   end else
   begin
-   uio^.uio_td:=GetMem(size);
-   Result:=_ttydisc_write(tp,uio,uio^.uio_td);
-   FreeMem(uio^.uio_td);
-   uio^.uio_td:=nil;
+   buf:=GetMem(size);
+   Result:=_ttydisc_write(tp,uio,buf);
+   FreeMem(buf);
   end;
  end else
  begin

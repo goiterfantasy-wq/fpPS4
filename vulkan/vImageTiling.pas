@@ -68,12 +68,19 @@ begin
  Result:=(x+1);
 end;
 
-Function GetLinearSize(const key:TvImageKey;align:Boolean):Ptruint;
+type
+ TLinearMode=(mPack,mAlign64,mAlign8x8);
+
+Function GetLinearSize(const key:TvImageKey;mode:TLinearMode):Ptruint;
 var
  m_bytePerElement:Ptruint;
- m_level,m_width,m_height:Ptruint;
- m_padwidth,m_padheight:Ptruint;
- m_slice:Ptruint;
+ m_level    :Ptruint;
+ m_width    :Ptruint;
+ m_height   :Ptruint;
+ m_padwidth :Ptruint;
+ m_padheight:Ptruint;
+ m_paddepth :Ptruint;
+ m_slice    :Ptruint;
 begin
  if key.params.samples>1 then
  begin
@@ -87,10 +94,12 @@ begin
  m_width :=key.params.width;
  m_height:=key.params.height;
 
- if (key.params.pow2pad<>0) then
+ m_paddepth:=key.params.depth;
+
+ if (key.params.tiling.idx=kTileModeThick_1dThick) then
  begin
-  m_width :=nextPowerOfTwo(m_width);
-  m_height:=nextPowerOfTwo(m_height);
+  //m_tileThickness
+  m_paddepth:=max((m_paddepth+3) and (not 3),4);
  end;
 
  Result:=0;
@@ -100,20 +109,28 @@ begin
   m_padwidth :=m_width;
   m_padheight:=m_height;
 
-  if align then
-  begin
-   m_padwidth:=GetLinearAlignWidth(m_bytePerElement,m_padwidth,m_padheight);
-  end;
-
   if IsTexelFormat(key.cformat) then
   begin
    m_padwidth :=(m_padwidth +3) shr 2;
    m_padheight:=(m_padheight+3) shr 2;
   end;
 
+  case mode of
+   mAlign64:
+    begin
+     m_padwidth:=GetLinearAlignWidth(m_bytePerElement,m_padwidth,m_padheight);
+    end;
+   mAlign8x8:
+    begin
+     m_padwidth :=max((m_padwidth +7) and (not 7),8);
+     m_padheight:=max((m_padheight+7) and (not 7),8);
+    end;
+   else;
+  end;
+
   m_slice:=m_padwidth*
            m_padheight*
-           key.params.depth*
+           m_paddepth*
            key.params.arrayLayers*
            m_bytePerElement;
 
@@ -130,21 +147,21 @@ end;
 
 Function GetLinearAlignSize(const key:TvImageKey):Ptruint;
 begin
- Result:=GetLinearSize(key,true);
+ Result:=GetLinearSize(key,mAlign64);
 end;
 
 Function Get1dThinSize(const key:TvImageKey):Ptruint;
-const
- m_tileThickness=1;
 var
  m_bytePerElement:Ptruint;
- m_level,m_width,m_height:Ptruint;
- m_padwidth   :Ptruint;
- m_padheight  :Ptruint;
+ m_level      :Ptruint;
+ m_width      :Ptruint;
+ m_pitch      :Ptruint;
+ m_height     :Ptruint;
  m_depth      :Ptruint;
  m_arrayLayers:Ptruint;
  m_slice      :Ptruint;
- log_sz       :Ptruint;
+
+ tiler:Tiler1d;
 begin
  Assert(key.params.samples<=1,'key.params.samples>1');
 
@@ -157,47 +174,31 @@ begin
  m_depth      :=key.params.depth;
  m_arrayLayers:=key.params.arrayLayers;
 
+ m_pitch:=max(key.params.pitch,key.params.width);
+
  if (key.params.pow2pad<>0) then
  begin
-  m_width      :=nextPowerOfTwo(m_width);
-  m_height     :=nextPowerOfTwo(m_height);
-  m_depth      :=nextPowerOfTwo(m_depth);
   m_arrayLayers:=nextPowerOfTwo(m_arrayLayers);
  end;
+
+ tiler.init_surface(m_bytePerElement,
+                    key.params.tiling.idx,
+                    key.params.tiling.alt,
+                    IsTexelFormat(key.cformat),
+                    (key.params.pow2pad<>0));
 
  Result:=0;
 
  while (m_level>0) do
  begin
-  m_padwidth :=m_width;
-  m_padheight:=m_height;
 
-  if IsTexelFormat(key.cformat) then
-  begin
-   m_padwidth :=(m_padwidth +3) shr 2;
-   m_padheight:=(m_padheight+3) shr 2;
-  end;
-
-  //microtile align
-  m_padwidth :=(m_padwidth +7) and (not 7);
-  m_padheight:=(m_padheight+7) and (not 7);
-
-  //for 1d textures
-  m_padheight:=max(m_padheight,8);
-
-  //align pitch to pipe_interleave_size
-  log_sz:=(m_padwidth*m_padheight*m_bytePerElement*m_tileThickness);
-  while (log_sz and 255)<>0 do //(log_sz mod 256)<>0
-  begin
-   m_padwidth:=m_padwidth+8;
-   log_sz:=(m_padwidth*m_padheight*m_bytePerElement*m_tileThickness);
-  end;
+  tiler.init_size(m_width,m_pitch,m_height,m_depth);
 
   if (m_level<>1) then
   begin
-   m_slice:=m_padwidth*
-            m_padheight*
-            m_depth*
+   m_slice:=tiler.m_paddedWidth*
+            tiler.m_paddedHeight*
+            tiler.m_paddedDepth*
             m_arrayLayers*
             m_bytePerElement;
 
@@ -206,8 +207,8 @@ begin
   begin
    //Trim the last layer
 
-   m_slice:=m_padwidth*
-            m_padheight*
+   m_slice:=tiler.m_paddedWidth*
+            tiler.m_paddedHeight*
             key.params.depth*
             key.params.arrayLayers*
             m_bytePerElement;
@@ -218,6 +219,7 @@ begin
 
   Dec(m_level);
   m_width :=Max(1,m_width  shr 1);
+  m_pitch :=Max(1,m_pitch  shr 1);
   m_height:=Max(1,m_height shr 1);
  end;
 
@@ -336,7 +338,7 @@ end;
 type
  t_copy_type=(BufferToImage,ImageToBuffer);
 
-Procedure _Copy_Linear(ctype:t_copy_type;cmd:TvCustomCmdBuffer;buf:TvTempBuffer;image:TvCustomImage2);
+Procedure _Copy_Linear(ctype:t_copy_type;mode:TLinearMode;cmd:TvCustomCmdBuffer;buf:TvTempBuffer;image:TvCustomImage2);
 var
  BufferImageCopy:TVkBufferImageCopy;
  size:Ptruint;
@@ -357,7 +359,7 @@ begin
 
  m_bytePerElement:=getFormatSize(image.key.cformat);
 
- size:=GetLinearSize(image.key,false);
+ size:=GetLinearSize(image.key,mode);
 
  case ctype of
   BufferToImage:
@@ -415,14 +417,32 @@ begin
   BufferImageCopy.imageExtent.width :=m_width;
   BufferImageCopy.imageExtent.height:=m_height;
 
+  m_padwidth :=m_width ;
+  m_padheight:=m_height;
+
   if IsTexelFormat(image.key.cformat) then
   begin
    m_padwidth :=(m_width +3) shr 2;
    m_padheight:=(m_height+3) shr 2;
-  end else
+  end;
+
+  case mode of
+   mAlign64:m_padwidth:=GetLinearAlignWidth(m_bytePerElement,m_padwidth,m_padheight);
+   mAlign8x8:
+    begin
+     m_padwidth :=max((m_padwidth +7) and (not 7),8);
+     m_padheight:=max((m_padheight+7) and (not 7),8);
+    end;
+   else;
+  end;
+
+  BufferImageCopy.bufferRowLength  :=m_padwidth;
+  BufferImageCopy.bufferImageHeight:=m_padheight;
+
+  if IsTexelFormat(image.key.cformat) then
   begin
-   m_padwidth :=m_width ;
-   m_padheight:=m_height;
+   BufferImageCopy.bufferRowLength  :=BufferImageCopy.bufferRowLength   shl 2;
+   BufferImageCopy.bufferImageHeight:=BufferImageCopy.bufferImageHeight shl 2;
   end;
 
   m_slice:=m_padwidth*m_padheight*m_bytePerElement;
@@ -471,58 +491,44 @@ begin
 
 end;
 
+{
+            linear  MicroTile
+            Width   align  log_sz
+                   (1..7)  align
+           +------+------+-------+
+  linear   |      |      |       |
+  Height   |      |      |       |
+           |      |      |       |  padding
+           +------+      |       |  Height
+MicroTile  |             |       |
+align(1..7)|             |       |
+           |             |       |
+           +---------------------+
+                  padding
+                  Width
+
+}
+
 Procedure copy_1dThin_to_linear(var tiler:Tiler1d;src,dst:Pointer);
-var
- m_bytePerElement:Ptruint;
- m_slice_size:Ptruint;
- i,x,y,z:QWORD;
- pSrc,pDst:Pointer;
 begin
- m_bytePerElement:=tiler.m_bytePerElement;
- m_slice_size:=(tiler.m_linearWidth*tiler.m_linearHeight);
- //
- For z:=0 to tiler.m_linearDepth-1 do
-  For y:=0 to tiler.m_linearHeight-1 do
-   For x:=0 to tiler.m_linearWidth-1 do
-    begin
-     i:=0;
-     tiler.getTiledElementByteOffset(i,x,y,z);
-     pSrc:=@PByte(src)[i];
-     //
-     pDst:=@PByte(dst)[(z*m_slice_size+y*tiler.m_linearWidth+x)*m_bytePerElement];
-     //
-     Move(pSrc^,pDst^,m_bytePerElement);
-    end;
+ tiler.m_copy_tile2linear(dst,get_dmem_ptr(src),
+  tiler.m_linearWidth,
+  tiler.m_linearHeight,
+  tiler.m_linearDepth,
+  tiler.m_paddedWidth,
+  tiler.m_paddedHeight
+ );
 end;
 
 Procedure copy_linear_to_1dThin(var tiler:Tiler1d;src,dst:Pointer);
-var
- m_bytePerElement:Ptruint;
- m_slice_size:Ptruint;
- i,x,y,z:QWORD;
- pSrc,pDst:Pointer;
 begin
-
- //ImageToBuffer
-
- dst:=get_dmem_ptr(dst);
-
- //
- m_bytePerElement:=tiler.m_bytePerElement;
- m_slice_size:=(tiler.m_linearWidth*tiler.m_linearHeight);
- //
- For z:=0 to tiler.m_linearDepth-1 do
-  For y:=0 to tiler.m_linearHeight-1 do
-   For x:=0 to tiler.m_linearWidth-1 do
-    begin
-     pSrc:=@PByte(src)[(z*m_slice_size+y*tiler.m_linearWidth+x)*m_bytePerElement];
-     //
-     i:=0;
-     tiler.getTiledElementByteOffset(i,x,y,z);
-     pDst:=@PByte(dst)[i];
-     //
-     Move(pSrc^,pDst^,m_bytePerElement);
-    end;
+ tiler.m_copy_linear2tile(get_dmem_ptr(dst),src,
+  tiler.m_linearWidth,
+  tiler.m_linearHeight,
+  tiler.m_linearDepth,
+  tiler.m_paddedWidth,
+  tiler.m_paddedHeight
+ );
 end;
 
 Procedure load_write_1dThin(ctype:t_copy_type;
@@ -533,7 +539,13 @@ var
  tiler:Tiler1d;
 
  m_bytePerElement:Ptruint;
- m_level,m_width,m_height:Ptruint;
+
+ m_level      :Ptruint;
+ m_width      :Ptruint;
+ m_pitch      :Ptruint;
+ m_height     :Ptruint;
+ m_depth      :Ptruint;
+ m_arrayLayers:Ptruint;
 
  src:Pointer;
  dst:Pointer;
@@ -546,9 +558,10 @@ begin
  m_bytePerElement:=getFormatSize(image.key.cformat);
 
  tiler.init_surface(m_bytePerElement,
-                    ord(IsTexelFormat(image.key.cformat)),
                     image.key.params.tiling.idx,
-                    image.key.params.tiling.alt);
+                    image.key.params.tiling.alt,
+                    IsTexelFormat(image.key.cformat),
+                    (image.key.params.pow2pad<>0));
 
  //TvBuffer
 
@@ -558,20 +571,19 @@ begin
  m_width :=image.key.params.width;
  m_height:=image.key.params.height;
 
- if (image.key.params.pow2pad<>0) then
- begin
-  m_width :=nextPowerOfTwo(m_width);
-  m_height:=nextPowerOfTwo(m_height);
- end;
+ m_pitch:=max(image.key.params.pitch,image.key.params.width);
+
+ m_depth:=image.key.params.depth;
+ m_arrayLayers:=image.key.params.arrayLayers;
 
  src:=image.key.addr;
 
  while (m_level>0) do
  begin
-  tiler.init_size_2d(m_width,m_height);
+  tiler.init_size(m_width,m_pitch,m_height,m_depth);
 
   //array
-  for a:=0 to image.key.params.arrayLayers-1 do
+  for a:=0 to m_arrayLayers-1 do
   begin
 
    if (ptruint(dst-m_base)+tiler.m_linearSizeBytes)>m_full_linear_size then
@@ -608,17 +620,18 @@ begin
 
   if (image.key.params.pow2pad<>0) then
   begin
-   a:=nextPowerOfTwo(image.key.params.arrayLayers)-image.key.params.arrayLayers;
+   a:=nextPowerOfTwo(m_arrayLayers)-m_arrayLayers;
 
    src:=src+tiler.m_tiledSizeBytes*a;
   end;
 
-  //Writeln('nextPowerOfTwo =',nextPowerOfTwo(image.key.params.arrayLayers));
+  //Writeln('nextPowerOfTwo =',nextPowerOfTwo(m_arrayLayers));
 
   src:=Pointer((qword(src)+255) and (not 255));
 
   Dec(m_level);
   m_width :=Max(1,m_width  shr 1);
+  m_pitch :=Max(1,m_pitch  shr 1);
   m_height:=Max(1,m_height shr 1);
  end;
  //mips
@@ -641,16 +654,11 @@ begin
 
  Assert(image.key.params.samples<=1,'image.key.params.samples>1');
 
- m_full_linear_size:=GetLinearSize(image.key,False);
+ m_full_linear_size:=GetLinearSize(image.key,mAlign8x8);
 
  buf:=TvTempBuffer.Create(m_full_linear_size,ord(VK_BUFFER_USAGE_TRANSFER_SRC_BIT),nil);
 
- vmem:=MemManager.FetchMemory(buf.GetRequirements,V_PROP_HOST_VISIBLE or V_PROP_DEVICE_LOCAL,buf);
-
- if (vmem.FMemory=nil) then
- begin
-  vmem:=MemManager.FetchMemory(buf.GetRequirements,V_PROP_HOST_VISIBLE,buf);
- end;
+ vmem:=MemManager.FetchMemory(buf.GetRequirements,V_PROP_HOST_VISIBLE or V_PROP_HOST_CACHED,buf);
 
  if (vmem.FMemory=nil) then
  begin
@@ -675,9 +683,11 @@ begin
                    m_full_linear_size,
                    m_base);
 
+ vmem.Flush(m_full_linear_size);
+
  vkUnmapMemory(Device.FHandle,buf.FBind.FMemory.FHandle);
 
- _Copy_Linear(BufferToImage,cmd,buf,image);
+ _Copy_Linear(BufferToImage,mAlign8x8,cmd,buf,image);
 end;
 
 type
@@ -698,6 +708,8 @@ begin
              m_full_linear_size,
              0,
              @m_base);
+
+ FBind.Flush(m_full_linear_size);
 
  load_write_1dThin(ImageToBuffer,
                    image,
@@ -722,7 +734,7 @@ begin
 
  Assert(image.key.params.samples<=1,'image.key.params.samples>1');
 
- m_full_linear_size:=GetLinearSize(image.key,False);
+ m_full_linear_size:=GetLinearSize(image.key,mAlign8x8);
 
  buf:=TvTempBufferWriteback.Create(m_full_linear_size,ord(VK_BUFFER_USAGE_TRANSFER_DST_BIT),nil);
 
@@ -731,12 +743,7 @@ begin
 
  image.Hold(buf);
 
- vmem:=MemManager.FetchMemory(buf.GetRequirements,V_PROP_HOST_VISIBLE or V_PROP_DEVICE_LOCAL,buf);
-
- if (vmem.FMemory=nil) then
- begin
-  vmem:=MemManager.FetchMemory(buf.GetRequirements,V_PROP_HOST_VISIBLE,buf);
- end;
+ vmem:=MemManager.FetchMemory(buf.GetRequirements,V_PROP_HOST_VISIBLE or V_PROP_HOST_CACHED,buf);
 
  if (vmem.FMemory=nil) then
  begin
@@ -748,7 +755,7 @@ begin
 
  vmem.Release; //FetchMemory
 
- _Copy_Linear(ImageToBuffer,cmd,buf,image);
+ _Copy_Linear(ImageToBuffer,mAlign8x8,cmd,buf,image);
 end;
 
 function Load_Linear(cmd:TvCustomCmdBuffer;image:TvCustomImage2):Boolean;
@@ -771,7 +778,13 @@ begin
 
  m_bytePerElement:=getFormatSize(image.key.cformat);
 
- size:=GetLinearSize(image.key,(image.key.params.tiling.idx<>kTileModeDisplay_LinearGeneral));
+ if (image.key.params.tiling.idx=kTileModeDisplay_LinearGeneral) then
+ begin
+  size:=GetLinearSize(image.key,mPack);
+ end else
+ begin
+  size:=GetLinearSize(image.key,mAlign64);
+ end;
 
  buf:=FetchHostBuffer(cmd,
                       QWORD(image.key.addr),
@@ -900,7 +913,13 @@ begin
 
  m_bytePerElement:=getFormatSize(image.key.cformat);
 
- size:=GetLinearSize(image.key,(image.key.params.tiling.idx<>kTileModeDisplay_LinearGeneral));
+ if (image.key.params.tiling.idx=kTileModeDisplay_LinearGeneral) then
+ begin
+  size:=GetLinearSize(image.key,mPack);
+ end else
+ begin
+  size:=GetLinearSize(image.key,mAlign64);
+ end;
 
  buf:=FetchHostBuffer(cmd,
                       QWORD(image.key.addr),
@@ -1045,9 +1064,6 @@ begin
  set_tiling_cbs(kTileModeThin_2dThin          ,0,@Load_Linear,@Writeback_Linear,@GetLinearAlignSize); //@load_clear;
  set_tiling_cbs(kTileModeThin_2dThin          ,1,@Load_Linear,@Writeback_Linear,@GetLinearAlignSize); //@load_clear;
 
- set_tiling_cbs(kTileModeThick_1dThick        ,0,@Load_Linear,@Writeback_Linear,@GetLinearAlignSize); //@load_clear;
- set_tiling_cbs(kTileModeThick_1dThick        ,1,@Load_Linear,@Writeback_Linear,@GetLinearAlignSize); //@load_clear;
-
  //
  set_tiling_cbs(kTileModeDepth_1dThin         ,0,@load_1dThin,@write_1dThin,@Get1dThinSize);
  set_tiling_cbs(kTileModeDepth_1dThin         ,1,@load_1dThin,@write_1dThin,@Get1dThinSize);
@@ -1057,6 +1073,9 @@ begin
 
  set_tiling_cbs(kTileModeThin_1dThin          ,0,@load_1dThin,@write_1dThin,@Get1dThinSize);
  set_tiling_cbs(kTileModeThin_1dThin          ,1,@load_1dThin,@write_1dThin,@Get1dThinSize);
+
+ set_tiling_cbs(kTileModeThick_1dThick        ,0,@load_1dThin,@write_1dThin,@Get1dThinSize);
+ set_tiling_cbs(kTileModeThick_1dThick        ,1,@load_1dThin,@write_1dThin,@Get1dThinSize);
  //
 
  set_tiling_cbs(kTileModeDisplay_LinearAligned,0,@Load_Linear,@Writeback_Linear,@GetLinearAlignSize);

@@ -20,7 +20,7 @@ uses
  vmparam,
  dmem_map,
  kern_dmem,
- sys_vm_object,
+ vm_object,
  vm_pager,
  kern_authinfo,
  kern_budget,
@@ -85,7 +85,7 @@ begin
 
  len:=data^.len;
 
- if ((QWORD($fc00000000) - addr) < len) then
+ if ((MAP_AREA_END - addr) < len) then
  begin
   Exit(EINVAL);
  end;
@@ -142,7 +142,7 @@ begin
             begin
              with PAllocateDirectMemory(data)^ do
              begin
-              Result:=dmem_map_alloc(dmap^.dmem,start,__end,len,align,mtype,start);
+              Result:=dmem_map_alloc(dmap^.dmem,start,__end,len,align,mtype,acl_app,start);
               {
               Writeln('dmem_map_alloc(0x',HexStr(start,11),
                                     ',0x',HexStr(__end,11),
@@ -157,7 +157,7 @@ begin
             begin
              with PAllocateDirectMemory(data)^ do
              begin
-              Result:=dmem_map_alloc(dmap^.dmem,0,kern_budget.DMEM_LIMIT,len,align,mtype,start);
+              Result:=dmem_map_alloc(dmap^.dmem,0,kern_budget.DMEM_LIMIT,len,align,mtype,acl_app,start);
              end;
             end;
 
@@ -165,7 +165,7 @@ begin
             begin
              with PReleaseDirectMemory(data)^ do
              begin
-              Result:=dmem_map_release(dmap^.dmem,start,len,False);
+              Result:=dmem_map_release(dmap^.dmem,start,len,acl_app,False);
              end;
             end;
 
@@ -173,7 +173,7 @@ begin
             begin
              with PReleaseDirectMemory(data)^ do
              begin
-              Result:=dmem_map_release(dmap^.dmem,start,len,True);
+              Result:=dmem_map_release(dmap^.dmem,start,len,acl_app,True);
              end;
             end;
 
@@ -303,15 +303,18 @@ begin
                             OFF_TO_IDX(ofs+size),
                             -1,
                             nprot,
-                            flags);
+                            (flags and MAP_WRITABLE_WB_GARLIC)
+                           );
 
  if (Result<>0) then Exit;
 
- maxprotp^:=maxprotp^ or VM_PROT_GPU_ALL;
+ maxprotp^:=(maxprotp^ or VM_PROT_GPU_ALL);
 
  obj^:=dmap^.vobj;
 
- if ((maxprotp^ and nprot)=nprot) then
+ // dmem doesn't allow you to create executable pages,
+ // but it does allow you to modify them later, so I don't touch maxprotp
+ if ((maxprotp^ and (not VM_PROT_EXECUTE) and nprot)=nprot) then
  begin
   Assert(obj^<>nil);
   vm_object_reference(obj^);

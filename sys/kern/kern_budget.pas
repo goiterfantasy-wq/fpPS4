@@ -46,16 +46,16 @@ function  sys_budget_getid():Integer;
 //internals
 type
  t_budget_info=packed record
-  zero      :QWORD;
-  dmem_alloc:QWORD;
-  malloc    :QWORD;
-  mlock     :QWORD;
+  zero  :QWORD;
+  mdmem :QWORD;
+  malloc:QWORD;
+  mlock :QWORD;
  end;
 
 const
- field_dmem_alloc=1;
- field_mlock     =2;
- field_malloc    =3;
+ field_mdmem =1;
+ field_mlock =2;
+ field_malloc=3;
 
 const
  FMEM_BASE           =$4000000;  //64MB  Minimum reserved size of flex memory at system startup
@@ -95,6 +95,10 @@ function  vm_budget_used   (ptype,field:Integer):QWORD;
 function  vm_budget_reserve(ptype,field:Integer;len:QWORD):Integer;
 procedure vm_budget_release(ptype,field:Integer;len:QWORD);
 
+function  bp_budget_reserve(ptype:Integer):Integer;
+procedure bp_budget_release(ptype:Integer);
+
+procedure init_system_limits;
 procedure init_bigapp_limits;
 procedure set_bigapp_cred_limits;
 procedure set_bigapp_limits(size,is_2MB_align:QWORD);
@@ -137,107 +141,181 @@ uses
  kern_authinfo;
 
 var
- budget_limit  :t_budget_info;
- budget_reserve:t_budget_info;
+ budget_vm_limit  :array[0..3] of t_budget_info;
+ budget_vm_reserve:array[0..3] of t_budget_info;
 
- budget_lock   :Pointer;
+ budget_vm_lock:Pointer;
+
+ budget_bp_limit:array[0..3] of DWORD;
+ budget_bp_used :array[0..3] of DWORD;
+
+ budget_bp_lock:Pointer;
+
+const
+ ptype_str:array[0..3] of pchar=(
+  'BIG_APP ',
+  'MINI_APP',
+  'SYSTEM  ',
+  'NONGAME '
+ );
+
+ field_str:array[0..3] of pchar=(
+  '',
+  'mdmem ',
+  'mlock ',
+  'malloc'
+ );
 
 procedure vm_set_budget_limit(ptype,field:Integer;value:QWORD);
 begin
- case field of
-  field_dmem_alloc:Writeln('vm_set_budget_limit(dmem_alloc,0x',HexStr(value,16),')');
-  field_mlock     :Writeln('vm_set_budget_limit(mlock     ,0x',HexStr(value,16),')');
-  field_malloc    :Writeln('vm_set_budget_limit(malloc    ,0x',HexStr(value,16),')');
-  else;
- end;
+ if (DWORD(ptype)>3) or (DWORD(field-1)>2) then Exit;
 
- rw_wlock(budget_lock);
+ Writeln('vm_set_budget_limit(',ptype_str[ptype],',',field_str[field],',0x',HexStr(value,16),')');
 
-  //TODO: ptype/budget_id ignored
-  PQWORD(@budget_limit)[field]:=value;
+ rw_wlock(budget_vm_lock);
 
- rw_wunlock(budget_lock);
+  PQWORD(@budget_vm_limit[ptype])[field]:=value;
+
+ rw_wunlock(budget_vm_lock);
 end;
 
 function vm_budget_limit(ptype,field:Integer):QWORD;
 begin
- rw_wlock(budget_lock);
+ if (DWORD(ptype)>3) or (DWORD(field-1)>2) then Exit(0);
 
-  //TODO: ptype/budget_id ignored
-  Result:=PQWORD(@budget_limit)[field];
+ rw_wlock(budget_vm_lock);
 
- rw_wunlock(budget_lock);
+  Result:=PQWORD(@budget_vm_limit[ptype])[field];
+
+ rw_wunlock(budget_vm_lock);
 end;
 
 function vm_budget_used(ptype,field:Integer):QWORD;
 begin
- rw_wlock(budget_lock);
+ if (DWORD(ptype)>3) or (DWORD(field-1)>2) then Exit(0);
 
-  //TODO: ptype/budget_id ignored
-  Result:=PQWORD(@budget_reserve)[field];
+ rw_wlock(budget_vm_lock);
 
- rw_wunlock(budget_lock);
+  Result:=PQWORD(@budget_vm_reserve[ptype])[field];
+
+ rw_wunlock(budget_vm_lock);
 end;
 
 function vm_budget_reserve(ptype,field:Integer;len:QWORD):Integer;
 var
  rsv,limit:QWORD;
 begin
- if (ptype<PTYPE_BIG_APP) or (len=0) then
- begin
-  Result:=0;
- end else
- begin
-  rw_wlock(budget_lock);
+ if (DWORD(ptype)>3) or (DWORD(field-1)>2) then Exit(0);
 
-   //TODO: ptype/budget_id ignored
+ rw_wlock(budget_vm_lock);
 
-   rsv  :=PQWORD(@budget_reserve)[field];
-   limit:=PQWORD(@budget_limit  )[field];
+  rsv  :=PQWORD(@budget_vm_reserve[ptype])[field];
+  limit:=PQWORD(@budget_vm_limit  [ptype])[field];
 
-   {
-   if field=3 then
-   begin
-    Writeln('vm_budget_reserve:',' rsv=0x',HexStr(rsv,10),' limit=0x',HexStr(limit,10),' len=0x',HexStr(len,10));
-   end;
-   }
+  if (rsv <= limit) and
+     (len <= (limit - rsv)) then
+  begin
+   PQWORD(@budget_vm_reserve[ptype])[field]:=rsv + len;
+   Result:=0;
+  end else
+  begin
+   Result:=ENOMEM;
+  end;
 
-   if (rsv <= limit) and
-      (len <= (limit - rsv)) then
-   begin
-    PQWORD(@budget_reserve)[field]:=rsv + len;
-    Result:=0;
-   end else
-   begin
-    Result:=ENOMEM;
-   end;
-
-  rw_wunlock(budget_lock);
- end;
+ rw_wunlock(budget_vm_lock);
 end;
 
 procedure vm_budget_release(ptype,field:Integer;len:QWORD);
 var
  rsv,size:QWORD;
 begin
- if (ptype > -1) and (len<>0) then
- begin
-  rw_wlock(budget_lock);
+ if (DWORD(ptype)>3) or (DWORD(field-1)>2) or (len=0) then Exit;
 
-   //TODO: ptype/budget_id ignored
+ rw_wlock(budget_vm_lock);
 
-   rsv:=PQWORD(@budget_reserve)[field];
+  rsv:=PQWORD(@budget_vm_reserve[ptype])[field];
 
-   size:=0;
-   if (len <= rsv) then
-   begin
-    size:=rsv - len;
-   end;
+  size:=0;
+  if (len <= rsv) then
+  begin
+   size:=rsv - len;
+  end;
 
-   PQWORD(@budget_reserve)[field]:=size;
+  PQWORD(@budget_vm_reserve[ptype])[field]:=size;
 
-  rw_wunlock(budget_lock);
- end;
+ rw_wunlock(budget_vm_lock);
+end;
+
+//
+
+procedure bp_set_budget_limit(ptype:Integer;value:DWORD);
+begin
+ if (DWORD(ptype)>3) then Exit;
+
+ Writeln('bp_set_budget_limit(',ptype_str[ptype],',0x',HexStr(value,8),')');
+
+ rw_wlock(budget_bp_lock);
+
+  budget_bp_limit[ptype]:=value;
+
+ rw_wunlock(budget_bp_lock);
+end;
+
+function bp_budget_reserve(ptype:Integer):Integer;
+var
+ rsv,limit:DWORD;
+begin
+ if (DWORD(ptype)>3) then Exit(0);
+
+ rw_wlock(budget_bp_lock);
+
+  rsv  :=budget_bp_used [ptype];
+  limit:=budget_bp_limit[ptype];
+
+  if (rsv <= limit) and
+     ((limit - rsv) >= 1) then
+  begin
+   budget_bp_used[ptype]:=rsv + 1;
+   Result:=0;
+  end else
+  begin
+   Result:=ENOMEM;
+  end;
+
+ rw_wunlock(budget_bp_lock);
+end;
+
+procedure bp_budget_release(ptype:Integer);
+var
+ rsv,size:DWORD;
+begin
+ if (DWORD(ptype)>3) then Exit;
+
+ rw_wlock(budget_bp_lock);
+
+  rsv:=budget_bp_used[ptype];
+
+  size:=0;
+  if (rsv >= 1) then
+  begin
+   size:=rsv - 1;
+  end;
+
+  budget_bp_used[ptype]:=size;
+
+ rw_wunlock(budget_bp_lock);
+end;
+
+//
+
+procedure init_system_limits;
+begin
+ vm_set_budget_limit(PTYPE_SYSTEM,field_mlock ,$2F068000);
+ vm_set_budget_limit(PTYPE_SYSTEM,field_malloc,$2F068000);
+ //
+ bp_set_budget_limit(PTYPE_BIG_APP ,4);
+ bp_set_budget_limit(PTYPE_MINI_APP,4);
+ bp_set_budget_limit(PTYPE_SYSTEM  ,128);
 end;
 
 procedure init_bigapp_limits;
@@ -270,9 +348,9 @@ begin
 
  DMEM_LIMIT:=dmem_size;
 
- vm_set_budget_limit(PTYPE_BIG_APP,field_dmem_alloc,limit_value);
- vm_set_budget_limit(PTYPE_BIG_APP,field_mlock     ,(game_fmem_size + m_256) - FMEM_BASE);
- vm_set_budget_limit(PTYPE_BIG_APP,field_malloc    ,(game_fmem_size + m_256));
+ vm_set_budget_limit(PTYPE_BIG_APP,field_mdmem ,limit_value);
+ vm_set_budget_limit(PTYPE_BIG_APP,field_mlock ,(game_fmem_size + m_256) - FMEM_BASE);
+ vm_set_budget_limit(PTYPE_BIG_APP,field_malloc,(game_fmem_size + m_256));
 end;
 
 procedure set_bigapp_cred_limits;
@@ -311,9 +389,9 @@ begin
 
  FMEM_LIMIT:=size;
 
- vm_set_budget_limit(PTYPE_BIG_APP,field_dmem_alloc,limit_value);
- vm_set_budget_limit(PTYPE_BIG_APP,field_mlock     ,(game_fmem_size + m_256) - FMEM_BASE);
- vm_set_budget_limit(PTYPE_BIG_APP,field_malloc    ,(game_fmem_size + m_256));
+ vm_set_budget_limit(PTYPE_BIG_APP,field_mdmem ,limit_value);
+ vm_set_budget_limit(PTYPE_BIG_APP,field_mlock ,(game_fmem_size + m_256) - FMEM_BASE);
+ vm_set_budget_limit(PTYPE_BIG_APP,field_malloc,(game_fmem_size + m_256));
 end;
 
 procedure set_bigapp_limits(size,is_2MB_align:QWORD);
@@ -365,9 +443,9 @@ begin
    limit_value:=DMEM_LIMIT;
   end;
 
-  vm_set_budget_limit(PTYPE_BIG_APP,field_dmem_alloc,limit_value);
-  vm_set_budget_limit(PTYPE_BIG_APP,field_mlock     ,(game_fmem_size + m_256) - FMEM_BASE);
-  vm_set_budget_limit(PTYPE_BIG_APP,field_malloc    ,(game_fmem_size + m_256));
+  vm_set_budget_limit(PTYPE_BIG_APP,field_mdmem ,limit_value);
+  vm_set_budget_limit(PTYPE_BIG_APP,field_mlock ,(game_fmem_size + m_256) - FMEM_BASE);
+  vm_set_budget_limit(PTYPE_BIG_APP,field_malloc,(game_fmem_size + m_256));
  end;
 end;
 
@@ -409,9 +487,9 @@ begin
   limit_value:=DMEM_LIMIT;
  end;
 
- vm_set_budget_limit(PTYPE_BIG_APP,field_dmem_alloc,limit_value);
- vm_set_budget_limit(PTYPE_BIG_APP,field_mlock     ,(game_fmem_size + m_256) - FMEM_BASE);
- vm_set_budget_limit(PTYPE_BIG_APP,field_malloc    ,(game_fmem_size + m_256));
+ vm_set_budget_limit(PTYPE_BIG_APP,field_mdmem ,limit_value);
+ vm_set_budget_limit(PTYPE_BIG_APP,field_mlock ,(game_fmem_size + m_256) - FMEM_BASE);
+ vm_set_budget_limit(PTYPE_BIG_APP,field_malloc,(game_fmem_size + m_256));
 
  if (vm_budget_reserve(PTYPE_BIG_APP,field_mlock,size)<>0) then
  begin
@@ -462,9 +540,6 @@ begin
 end;
 
 function dmem_process_relocated():Integer;
-label
- _no_mem_param,
- _next;
 var
  proc_param:TSceProcParam;
 
@@ -479,7 +554,6 @@ var
  mmap_flags:Integer;
 
  ExtendedCpuPageTable:QWORD;
- ExtendedPageTable   :QWORD;
  ExtendedGpuPageTable:QWORD;
  FlexibleMemorySize  :QWORD;
 
@@ -497,43 +571,32 @@ begin
  end;
 
  proc_param:=Default(TSceProcParam);
+ mem_param :=Default(TSceKernelMemParam);
+
  Result:=copy_proc_param(@proc_param);
 
- if (Result=ENOENT) then
+ if (Result=0) and (proc_param._sceKernelMemParam<>nil) then
  begin
-  _no_mem_param:
-  mem_param:=Default(TSceKernelMemParam);
-  Result:=0;
- end else
- begin
-  if (Result=0) then
+  mem_param_size:=fuword64(proc_param._sceKernelMemParam^.Size);
+
+  if (mem_param_size=QWORD(-1)) then
   begin
-   if (proc_param._sceKernelMemParam=nil) then goto _no_mem_param;
-
-   mem_param_size:=fuword64(proc_param._sceKernelMemParam^.Size);
-
-   if (mem_param_size=QWORD($ffffffffffffffff)) then
+   Result:=EACCES;
+  end else
+  begin
+   if (mem_param_size>sizeof(TSceKernelMemParam)) then
    begin
-    Result:=EACCES;
-   end else
-   begin
-    if (mem_param_size>sizeof(TSceKernelMemParam)) then
-    begin
-     mem_param_size:=sizeof(TSceKernelMemParam);
-    end;
-
-    mem_param:=Default(TSceKernelMemParam);
-    Result:=copyin(proc_param._sceKernelMemParam,@mem_param,mem_param_size);
-
-    if (Result=0) then goto _next;
+    mem_param_size:=sizeof(TSceKernelMemParam);
    end;
 
+   Result:=copyin(proc_param._sceKernelMemParam,@mem_param,mem_param_size);
   end;
-  //
-  Writeln('[KERNEL] ERROR: failed to load memory parameter: ',Result);
  end;
 
- _next:
+ if (Result<>0) then
+ begin
+  Writeln('[KERNEL] ERROR: failed to load memory parameter: ',Result);
+ end;
 
  if (Byte((mmap_flags xor 1) or ord(g_self_loading=0))=0) then
  begin
@@ -573,15 +636,15 @@ begin
 
    DMEM_LIMIT:=dmem_size;
 
-   vm_set_budget_limit(PTYPE_BIG_APP,field_dmem_alloc,size);
-   vm_set_budget_limit(PTYPE_BIG_APP,field_mlock     ,(game_fmem_size + m_256) - FMEM_BASE);
-   vm_set_budget_limit(PTYPE_BIG_APP,field_malloc    ,(game_fmem_size + m_256));
+   vm_set_budget_limit(PTYPE_BIG_APP,field_mdmem ,size);
+   vm_set_budget_limit(PTYPE_BIG_APP,field_mlock ,(game_fmem_size + m_256) - FMEM_BASE);
+   vm_set_budget_limit(PTYPE_BIG_APP,field_malloc,(game_fmem_size + m_256));
   end;
 
   ExtendedMemory2:=true;
   if (p_proc.p_sdk_version < $5000000) then
   begin
-   if (mem_param.sceKernelExtendedMemory2<>nil) then
+   if (mem_param.sceKernelExtendedMemory2=nil) then
    begin
     ExtendedMemory2:=False;
    end else
@@ -622,9 +685,9 @@ begin
 
     DMEM_LIMIT:=dmem_size;
 
-    vm_set_budget_limit(PTYPE_BIG_APP,field_dmem_alloc,size);
-    vm_set_budget_limit(PTYPE_BIG_APP,field_mlock     ,(game_fmem_size + m_256) - FMEM_BASE);
-    vm_set_budget_limit(PTYPE_BIG_APP,field_malloc    ,(game_fmem_size + m_256));
+    vm_set_budget_limit(PTYPE_BIG_APP,field_mdmem ,size);
+    vm_set_budget_limit(PTYPE_BIG_APP,field_mlock ,(game_fmem_size + m_256) - FMEM_BASE);
+    vm_set_budget_limit(PTYPE_BIG_APP,field_malloc,(game_fmem_size + m_256));
    end;
 
   end;
@@ -637,20 +700,22 @@ begin
    ExtendedCpuPageTable:=fuword64(mem_param.sceKernelExtendedCpuPageTable^);
   end;
 
-  if (mem_param.sceKernelExtendedPageTable=nil) then
+  if (Int64(ExtendedCpuPageTable) < 0) then
   begin
-   ExtendedPageTable:=QWORD(Int64(-1));
-  end else
-  begin
-   ExtendedPageTable:=fuword64(mem_param.sceKernelExtendedPageTable^);
+   if (mem_param.sceKernelExtendedPageTable=nil) then
+   begin
+    ExtendedCpuPageTable:=QWORD(Int64(-1));
+   end else
+   begin
+    ExtendedCpuPageTable:=fuword64(mem_param.sceKernelExtendedPageTable^);
+   end;
+
+   if (Int64(ExtendedCpuPageTable) < 1) then
+   begin
+    ExtendedCpuPageTable:=0;
+   end;
   end;
 
-
-  if (int64(ExtendedCpuPageTable) < 0) and
-     (int64(ExtendedPageTable) < 1) then
-  begin
-   ExtendedCpuPageTable:=0;
-  end else
   if (ExtendedCpuPageTable > $1000000000) then
   begin
    ExtendedCpuPageTable:=0;
@@ -692,7 +757,7 @@ begin
       Result:=0;
       FMEM_SIZE:=bigapp_max_fmem_size;
 
-      if (FlexibleMemorySize<>QWORD($ffffffffffffffff)) then
+      if (FlexibleMemorySize<>QWORD(-1)) then
       begin
        FMEM_SIZE:=FMEM_BASE + FlexibleMemorySize;
 
@@ -740,18 +805,18 @@ begin
  begin
   if (mem_param.sceKernelExtendedPageTable=nil) then
   begin
-   ExtendedPageTable:=QWORD(Int64(-1));
+   ExtendedCpuPageTable:=QWORD(Int64(-1));
   end else
   begin
-   ExtendedPageTable:=fuword64(mem_param.sceKernelExtendedPageTable^);
+   ExtendedCpuPageTable:=fuword64(mem_param.sceKernelExtendedPageTable^);
   end;
 
-  if (Int64(ExtendedPageTable) < 1) or
-     (ExtendedPageTable=$100000000) then
+  if (Int64(ExtendedCpuPageTable) < 1) or
+     (ExtendedCpuPageTable=$100000000) then
   begin
-   if (Int64(ExtendedPageTable) > 0) then
+   if (Int64(ExtendedCpuPageTable) > 0) then
    begin
-    allocate_extended_page_table_pool(ExtendedPageTable,0,0);
+    allocate_extended_page_table_pool(ExtendedCpuPageTable,0,0);
    end;
   end else
   begin
@@ -760,14 +825,14 @@ begin
 
  end;
 
- Writeln('DMEM_LIMIT          =0x',HexStr(DMEM_LIMIT,16));
- Writeln('FMEM_LIMIT          =0x',HexStr(FMEM_LIMIT,16));
- Writeln('BigAppMem           =0x',HexStr(BigAppMemory,16));
- Writeln('game_fmem_size      =0x',HexStr(game_fmem_size,16));
+ Writeln('DMEM_LIMIT      =0x',HexStr(DMEM_LIMIT,16));
+ Writeln('FMEM_LIMIT      =0x',HexStr(FMEM_LIMIT,16));
+ Writeln('BigAppMem       =0x',HexStr(BigAppMemory,16));
+ Writeln('game_fmem_size  =0x',HexStr(game_fmem_size,16));
  //
- Writeln('vm_budget_dmem_alloc=0x',HexStr(vm_budget_limit(PTYPE_BIG_APP,field_dmem_alloc),16));
- Writeln('vm_budget_mlock     =0x',HexStr(vm_budget_limit(PTYPE_BIG_APP,field_mlock     ),16));
- Writeln('vm_budget_malloc    =0x',HexStr(vm_budget_limit(PTYPE_BIG_APP,field_malloc    ),16));
+ Writeln('vm_budget_dmem  =0x',HexStr(vm_budget_limit(PTYPE_BIG_APP,field_mdmem ),16));
+ Writeln('vm_budget_mlock =0x',HexStr(vm_budget_limit(PTYPE_BIG_APP,field_mlock ),16));
+ Writeln('vm_budget_malloc=0x',HexStr(vm_budget_limit(PTYPE_BIG_APP,field_malloc),16));
 end;
 
 function get_mlock_avail():QWORD;

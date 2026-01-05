@@ -180,6 +180,7 @@ type
   function  OpLogicalAndTo(src0,src1:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
   //
   function  OpIsNanTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
+  function  OpIsInfTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
   function  OpIsSSignTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
   function  OpIEqualTo(src0,src1:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
   function  OpINotEqualTo(src0,src1:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
@@ -188,6 +189,9 @@ type
   //
   function  OpBitCountTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
   function  OpCmpTo(OpId:DWORD;src0,src1:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
+  //
+  function  OpSubgroupBallotTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
+  function  OpSubgroupBallotBitCountTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
   //
   function  OpImageSampleImplicitLod(pLine:TspirvOp;img:TsrNode;dst,coord:TsrRegNode):TspirvOp;
   function  OpImageSampleExplicitLod(pLine:TspirvOp;img:TsrNode;dst,coord:TsrRegNode):TspirvOp;
@@ -299,6 +303,9 @@ begin
   //It means that lane_id=0
   MakeCopy  (exe0,val);
   SetConst_q(exe1,dtUnknow,0); //set zero
+  //
+  MarkWave(exe0);
+  MarkWave(exe1);
  end;
 end;
 
@@ -1210,6 +1217,9 @@ Var
  dst:TsrRegSampledImage;
  node:TspirvOp;
 begin
+ Assert(Tgrp<>nil);
+ Assert(Sgrp<>nil);
+
  src[0]:=Tgrp;
  src[1]:=Sgrp;
 
@@ -1634,6 +1644,12 @@ begin
  _set_line(ppLine,_Op1(_get_line(ppLine),Op.OpIsNan,Result,src));
 end;
 
+function TEmitOp.OpIsInfTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
+begin
+ Result:=NewReg(dtBool);
+ _set_line(ppLine,_Op1(_get_line(ppLine),Op.OpIsInf,Result,src));
+end;
+
 function TEmitOp.OpIsSSignTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
 var
  zero:TsrRegNode;
@@ -1679,6 +1695,36 @@ function TEmitOp.OpCmpTo(OpId:DWORD;src0,src1:TsrRegNode;ppLine:PPspirvOp=nil):T
 begin
  Result:=NewReg(dtBool);
  _set_line(ppLine,_Op2(_get_line(ppLine),OpId,Result,src0,src1));
+end;
+
+//
+
+function TEmitOp.OpSubgroupBallotTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
+begin
+ Result:=NewReg(dtVec4u);
+ _set_line(ppLine,_Op2(_get_line(ppLine),
+                       Op.OpGroupNonUniformBallot,
+                       Result,
+                       NewImm_i(dtUint32,Scope.Subgroup),
+                       src)
+                      );
+end;
+
+
+function TEmitOp.OpSubgroupBallotBitCountTo(src:TsrRegNode;ppLine:PPspirvOp=nil):TsrRegNode;
+Var
+ node:TspirvOp;
+begin
+ Result:=NewReg(dtUint32);
+
+ node:=AddSpirvOp(_get_line(ppLine),Op.OpGroupNonUniformBallotBitCount); //need first
+ _set_line(ppLine,node);
+
+ node.pType:=TypeList.Fetch(dtUint32);
+ node.pDst:=Result;
+ node.AddParam(NewImm_i(dtUint32,Scope.Subgroup));
+ node.AddLiteral(GroupOperation.Reduce,'Reduce');
+ node.AddParam(src);
 end;
 
 //

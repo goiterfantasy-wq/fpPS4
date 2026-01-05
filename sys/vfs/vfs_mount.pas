@@ -74,12 +74,12 @@ procedure vfs_mountedfrom(mp:p_mount;from:PChar);
 procedure vfs_ref(mp:p_mount); inline;
 procedure vfs_rel(mp:p_mount); inline;
 
-procedure mount_init(mp:p_mount);
-procedure mount_fini(mp:p_mount);
+procedure vfs_mount_init();
 
 function  vfs_mount_alloc(vp    :p_vnode;
                           vfsp  :p_vfsconf;
                           fspath:PChar):p_mount;
+
 procedure vfs_mount_destroy(mp:p_mount);
 
 function  vfs_domount(fstype:PChar;         { Filesystem type. }
@@ -110,6 +110,7 @@ implementation
 uses
  murmurhash,
  errno,
+ uma,
  systm,
  subr_uio,
  vfs_vnops,
@@ -782,16 +783,28 @@ begin
  MNT_REL(mp);
 end;
 
-procedure mount_init(mp:p_mount);
+function mount_init(mem:Pointer;size,flags:Integer):Integer;
+var
+ mp:p_mount;
 begin
+ mp:=mem;
  mtx_init(mp^.mnt_mtx    ,'struct mount mtx');
  mtx_init(mp^.mnt_explock,'explock');
+ Result:=0;
 end;
 
-procedure mount_fini(mp:p_mount);
+procedure mount_fini(mem:Pointer;size:Integer);
+var
+ mp:p_mount;
 begin
+ mp:=mem;
  mtx_destroy(mp^.mnt_explock);
  mtx_destroy(mp^.mnt_mtx);
+end;
+
+procedure vfs_mount_init();
+begin
+ mount_zone:=uma_zcreate('Mountpoints', sizeof(t_mount), nil, nil, @mount_init, @mount_fini, UMA_ALIGN_PTR, UMA_ZONE_NOFREE);
 end;
 
 var
@@ -812,8 +825,7 @@ function vfs_mount_alloc(vp    :p_vnode;
 var
  mp:p_mount;
 begin
- mp:=AllocMem(SizeOf(t_mount));
- mount_init(mp);
+ mp:=uma_zalloc(mount_zone, M_WAITOK);
 
  TAILQ_INIT(@mp^.mnt_nvnodelist);
  mp^.mnt_nvnodelistsize:=0;
@@ -840,6 +852,8 @@ begin
 
  //arc4rand(&mp->mnt_hashseed, sizeof mp->mnt_hashseed, 0);
  mp^.mnt_hashseed:=get_mnt_hashseed;
+
+ mp^.mnt_budget_id:=-1;
 
  TAILQ_INIT(@mp^.mnt_uppers);
  Result:=mp;
@@ -880,16 +894,20 @@ begin
   vfs_freeopts(mp^.mnt_opt);
  end;
 
- mount_fini(mp);
- FreeMem(mp);
+ uma_zfree(mount_zone, mp);
+end;
+
+function GetStr(p:Pointer;L:SizeUint):RawByteString; inline;
+begin
+ SetString(Result,P,L);
 end;
 
 {
  * vfs_domount_first(): first file system mount (not update)
  }
-function vfs_domount_first(vfsp:p_vfsconf;       { File system type. }
-                           fspath:PChar;         { Mount path. }
-                           vp:p_vnode;           { Vnode to be covered. }
+function vfs_domount_first(vfsp   :p_vfsconf;    { File system type. }
+                           fspath :PChar;        { Mount path. }
+                           vp     :p_vnode;      { Vnode to be covered. }
                            fsflags:QWORD;        { Flags common to all filesystems. }
                            optlist:pp_vfsoptlist { Options local to the filesystem. }
                           ):Integer;
@@ -942,7 +960,8 @@ begin
  { XXXMAC: pass to vfs_mount_alloc? }
  mp^.mnt_optnew:=optlist^;
  { Set the mount level flags. }
- mp^.mnt_flag:=(fsflags and (MNT_UPDATEMASK or MNT_ROOTFS or MNT_RDONLY or MNT_EMU_PFS));
+ mp^.mnt_flag     :=(fsflags and (MNT_UPDATEMASK or MNT_ROOTFS or MNT_RDONLY or MNT_EMU_PFS));
+ mp^.mnt_budget_id:=((fsflags and MNT_BUDGET) div MNT_BIG_APP)-1;
 
  {
   * Mount the filesystem.
@@ -1448,6 +1467,13 @@ begin
    'union':
      begin
       fsflags:=fsflags or MNT_UNION;
+     end;
+   'budgetid':
+     case GetStr(opt^.value,opt^.len) of
+      'bigapp' :fsflags:=(fsflags and (not QWORD(MNT_BUDGET))) or MNT_BIG_APP;
+      'miniapp':fsflags:=(fsflags and (not QWORD(MNT_BUDGET))) or MNT_MINI_APP;
+      'system' :fsflags:=(fsflags and (not QWORD(MNT_BUDGET))) or MNT_SYSTEM;
+      else;
      end;
    else;
   end;

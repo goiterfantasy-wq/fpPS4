@@ -7,6 +7,7 @@ interface
 uses
   sysutils,
   ps4_pssl,
+  srOp,
   srNode,
   srType,
   srReg,
@@ -45,7 +46,7 @@ procedure TEmit_vbuf_load.buf_load(info:TBuf_info);
 var
  v:TvarChain;
 begin
- v:=TEmit_vbuf_chain(TObject(Self)).get_chain(info);
+ v:=TEmit_vbuf_chain(TObject(Self)).get_chain(info,dtUnknow);
 
  if (v.vType=vcUniformVector) then
  begin
@@ -179,7 +180,7 @@ begin
    lvl_1.pIndex:=sum_d;
    lvl_1.stride:=orig.stride;
 
-   elm:=lc.info.grp.Fetch(@lvl_0,@lvl_1,cflags(dtUnknow,lc.info.GLC,lc.info.SLC));
+   elm:=lc.info.grp.Fetch(line.Parent,@lvl_0,@lvl_1,cflags(dtUnknow,lc.info.GLC,lc.info.SLC));
   end;
 
   rsl:=FetchLoad(elm,lc.elem_orig);

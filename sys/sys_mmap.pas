@@ -20,26 +20,28 @@ const
  PROT_GPU_WRITE  =$20;
  PROT_GPU_ALL    =$30;
 
- MAP_SHARED       =$00001;   // share changes
- MAP_PRIVATE      =$00002;   // changes are private
- MAP_FIXED        =$00010;   // map addr must be exactly as requested
- MAP_NO_OVERWRITE =$00080;   // don't overwrite memory with MAP_FIXED
- MAP_VOID         =$00100;   // reserve addr
- MAP_HASSEMAPHORE =$00200;   // region may contain semaphores
- MAP_STACK        =$00400;   // region grows down, like a stack
- MAP_NOSYNC       =$00800;   // page to but do not sync underlying file
- MAP_FILE         =$00000;   // map from file (default)
- MAP_ANON         =$01000;   // allocated from memory, swap space
- MAP_ANONYMOUS    =MAP_ANON; // For compatibility.
- MAP_SYSTEM       =$02000;
- MAP_ALLAVAILABLE =$04000;
- MAP_NOCORE       =$20000;   // dont include these pages in a coredump
- MAP_PREFAULT_READ=$40000;   // prefault mapping for reading
- MAP_SELF         =$80000;   // map decryped SELF file
+ MAP_SHARED            =$00001;   // share changes
+ MAP_PRIVATE           =$00002;   // changes are private
+ MAP_FIXED             =$00010;   // map addr must be exactly as requested
+ MAP_NO_OVERWRITE      =$00080;   // don't overwrite memory with MAP_FIXED
+ MAP_VOID              =$00100;   // reserve addr
+ MAP_HASSEMAPHORE      =$00200;   // region may contain semaphores
+ MAP_STACK             =$00400;   // region grows down, like a stack
+ MAP_NOSYNC            =$00800;   // page to but do not sync underlying file
+ MAP_FILE              =$00000;   // map from file (default)
+ MAP_ANON              =$01000;   // allocated from memory, swap space
+ MAP_ANONYMOUS         =MAP_ANON; // For compatibility.
+ MAP_SYSTEM            =$02000;
+ MAP_ALLAVAILABLE      =$04000;
+ MAP_2MB_ALIGN         =$10000;
+ MAP_NOCORE            =$20000;   // dont include these pages in a coredump
+ MAP_PREFAULT_READ     =$40000;   // prefault mapping for reading
+ MAP_SELF              =$80000;   // map decryped SELF file
 
+ MAP_OPTIMAL_SPACE     =$100000;  // VMFS_OPTIMAL_SPACE
  MAP_SANITIZER         =$200000;  // devkit only
  MAP_NO_COALESCE       =$400000;  // do not merge nearby areas
- MAP_WRITABLE_WB_GARLIC=$800000;  // allow write to WB_GARLIC
+ MAP_WRITABLE_WB_GARLIC=$800000;  // allow GPU write to WB_GARLIC
 
  MAP_ALIGNMENT_BIT  =24;
  MAP_ALIGNMENT_SHIFT=24;
@@ -74,10 +76,6 @@ const
  MADV_NOCORE    = 8; // do not include these pages in a core file
  MADV_CORE      = 9; // revert to including pages in a core file
  MADV_PROTECT   =10; // protect process from pageout kill
-
-type
- p_query_memory_prot=vm_mmap.p_query_memory_prot;
- t_query_memory_prot=vm_mmap.t_query_memory_prot;
 
 //sce
 

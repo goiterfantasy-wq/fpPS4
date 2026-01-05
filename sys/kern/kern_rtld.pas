@@ -10,7 +10,7 @@ uses
  kern_param,
  kern_thr,
  vnode,
- sys_vm_object,
+ vm_object,
  vuio,
  elf64,
  kern_authinfo;
@@ -1133,7 +1133,7 @@ begin
  vm_map_lock(map);
 
  //remove prev if exist
- vm_map_delete(map,vaddr_lo,vaddr_hi,True);
+ vm_map_delete(map,vaddr_lo,vaddr_hi);
 
  vm_object_reference(imgp^.obj);
 
@@ -1142,8 +1142,7 @@ begin
                        offset,
                        vaddr_lo,vaddr_hi,
                        VM_PROT_RW, VM_PROT_ALL,
-                       0,
-                       nil,false,false);
+                       0,nil);
  if (Result<>0) then
  begin
   vm_map_unlock(map);
@@ -1199,7 +1198,7 @@ begin
 
  if (wire<>0) then
  begin
-  Result:=vm_map_wire(map,vaddr_lo,vaddr_hi,VM_MAP_WIRE_USER or 8);
+  Result:=vm_map_wire(map,vaddr_lo,vaddr_hi,VM_MAP_WIRE_USER or VM_MAP_WIRE_LOCK);
 
   if (Result<>0) then
   begin

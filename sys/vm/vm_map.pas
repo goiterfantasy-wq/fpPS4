@@ -9,9 +9,10 @@ uses
  sysutils,
  vm,
  vmparam,
+ vm_blockpool,
  vm_pmap,
- sys_vm_object,
  vm_object,
+ kern_vm_object,
  kern_mtx,
  kern_rangelock,
  kern_thr,
@@ -48,6 +49,7 @@ type
   inheritance   :vm_inherit_t;         // inheritance
   budget_id     :shortint;             // budget/ptype id
   name          :t_entry_name;         // entry name
+  cred          :Boolean;              // ucred imitate
   anon_addr     :Pointer;              // source code address
   entry_id      :QWORD;                // order id
  end;
@@ -69,6 +71,8 @@ type
   entry_id :QWORD;
   property  min_offset:vm_offset_t read header.start write header.start;
   property  max_offset:vm_offset_t read header.__end write header.__end;
+  const
+   system_map=0;
  end;
 
  p_vmspace=^vmspace;
@@ -109,7 +113,7 @@ const
  MAP_ENTRY_NEEDS_WAKEUP    =$0200; // waiters in transition
  MAP_ENTRY_NOCOREDUMP      =$0400; // don't include in a core
 
-                          //0x800
+ MAP_ENTRY_WIRE_LOCK       =$0800; // lock to user unwire
 
  MAP_ENTRY_GROWS_DOWN      =$1000; // Top-down stacks
  MAP_ENTRY_GROWS_UP        =$2000; // Bottom-up stacks
@@ -122,39 +126,45 @@ const
 
  MAP_ENTRY_IN_TRANSITION2  =$20000; // vm_map_type_protect,kern_mmap_dmem
 
-                      //0x40000
-                      //0x80000
+ MAP_ENTRY_KERNEL          =$40000; // MAP_COW_KERNEL
+ MAP_ENTRY_MMAP_DMEM       =$80000; // sys_mmap_dmem
 
- MAP_ENTRY_WIRE_BUDGET     =$100000;
- MAP_ENTRY_IN_BUDGET       =$200000;
- MAP_ENTRY_NO_COALESCE     =$400000;
+ MAP_ENTRY_WIRE_BUDGET     =$100000; // entry in wire budget
+ MAP_ENTRY_IN_BUDGET       =$200000; // entry in budget
+ MAP_ENTRY_NO_COALESCE     =$400000; // do not merge nearby areas
 
  //vm_flags_t values
  MAP_WIREFUTURE =$01; // wire all future pages
  MAP_BUSY_WAKEUP=$02;
-
-                //04
+ MAP_LOCK_WIRE  =$04;
 
  //Copy-on-write flags for vm_map operations
- MAP_INHERIT_SHARE   =$0001;
- MAP_COPY_ON_WRITE   =$0002;
- MAP_NOFAULT         =$0004;
- MAP_PREFAULT        =$0008;
- MAP_PREFAULT_PARTIAL=$0010;
- MAP_DISABLE_SYNCER  =$0020;
- MAP_DISABLE_COREDUMP=$0100;
- MAP_PREFAULT_MADVISE=$0200; // from (user) madvise request
- MAP_VN_WRITECOUNT   =$0400;
- MAP_STACK_GROWS_DOWN=$1000;
- MAP_STACK_GROWS_UP  =$2000;
- MAP_ACC_CHARGED     =$4000;
- MAP_ACC_NO_CHARGE   =$8000;
+ MAP_INHERIT_SHARE   =$000001;
+ MAP_COPY_ON_WRITE   =$000002;
+ MAP_NOFAULT         =$000004;
+ MAP_PREFAULT        =$000008;
+ MAP_PREFAULT_PARTIAL=$000010;
+ MAP_DISABLE_SYNCER  =$000020;
+ MAP_DISABLE_COREDUMP=$000100;
+ MAP_PREFAULT_MADVISE=$000200; // from (user) madvise request
+ MAP_VN_WRITECOUNT   =$000400;
+ MAP_STACK_GROWS_DOWN=$001000;
+ MAP_STACK_GROWS_UP  =$002000;
+ MAP_ACC_CHARGED     =$004000;
+ MAP_ACC_NO_CHARGE   =$008000;
 
- MAP_COW_SYSTEM      =$10000;
- MAP_COW_NO_BUDGET   =$20000;
- MAP_COW_KERNEL      =$40000;
+ MAP_COW_SYSTEM      =$010000;
+ MAP_COW_NO_BUDGET   =$020000;
+ MAP_COW_KERNEL      =$040000;
+
+ MAP_COW_MMAP_DMEM   =$080000; // emu ext -> sys_mmap_dmem
 
  MAP_COW_NO_COALESCE =$400000;
+
+ MAP_COW_NO_RMAP_FREE=$10000000; // emu ext
+ MAP_COW_AUTO_NAMING =$20000000; // emu ext
+ MAP_COW_PATCH       =$40000000; // emu ext
+ MAP_COW_HOLE        =$80000000; // emu ext
 
  //vm_fault option flags
  VM_FAULT_NORMAL       =0; // Nothing special
@@ -165,6 +175,7 @@ const
  VMFS_ANY_SPACE    =1; // find a range with any alignment
  VMFS_SUPER_SPACE  =2; // find a superpage-aligned range
  VMFS_OPTIMAL_SPACE=4; // find a range with optimal alignment
+ VMFS_OPTIMAL_SUPER=5;
 
  //vm_map_wire and vm_map_unwire option flags
  VM_MAP_WIRE_SYSTEM =0; // wiring in a kernel map
@@ -175,7 +186,7 @@ const
 
  VM_MAP_WIRE_WRITE  =4; // Validate writable.
 
-                   //8
+ VM_MAP_WIRE_LOCK   =8; // lock to user unwire
 
  VM_FAULT_READ_AHEAD_MIN = 7;
  VM_FAULT_READ_AHEAD_INIT=15;
@@ -200,10 +211,8 @@ function  vm_map_insert(
            __end :vm_offset_t;
            prot  :vm_prot_t;
            max   :vm_prot_t;
-           cow   :Integer;
-           anon  :Pointer;
-           alias :Boolean;
-           naming:Boolean):Integer;
+           cow   :DWORD;
+           anon  :Pointer):Integer;
 
 function  vm_map_findspace(map   :vm_map_t;
                            start :vm_offset_t;
@@ -231,38 +240,45 @@ function  vm_map_lookup_locked(var_map    :p_vm_map_t;        { IN/OUT }
                                wired      :PBoolean           { OUT }
                               ):Integer;
 
+procedure vm_map_protect_internal(map  :vm_map_t;
+                                  obj  :vm_object_t;
+                                  start:vm_offset_t;
+                                  __end:vm_offset_t;
+                                  prev :vm_prot_t;
+                                  prot :vm_prot_t);
+
 function  vm_map_protect(map     :vm_map_t;
                          start   :vm_offset_t;
                          __end   :vm_offset_t;
                          new_prot:vm_prot_t;
                          set_max :Boolean):Integer;
 
-function vm_map_type_protect(map      :vm_map_t;
-                             start    :vm_offset_t;
-                             __end    :vm_offset_t;
-                             new_mtype:Integer;
-                             new_prot :vm_prot_t):Integer;
+function  vm_map_type_protect(map      :vm_map_t;
+                              start    :vm_offset_t;
+                              __end    :vm_offset_t;
+                              new_mtype:Integer;
+                              new_prot :vm_prot_t):Integer;
 
 function  vm_map_madvise(map  :vm_map_t;
                          start:vm_offset_t;
                          __end:vm_offset_t;
                          behav:Integer):Integer;
 
-function vm_map_inherit(map            :vm_map_t;
-                        start          :vm_offset_t;
-                        __end          :vm_offset_t;
-                        new_inheritance:vm_inherit_t
-                        ):Integer;
+function  vm_map_inherit(map            :vm_map_t;
+                         start          :vm_offset_t;
+                         __end          :vm_offset_t;
+                         new_inheritance:vm_inherit_t
+                         ):Integer;
 
-function vm_map_unwire(map  :vm_map_t;
-                       start:vm_offset_t;
-                       __end:vm_offset_t;
-                       flags:Integer):Integer;
+function  vm_map_unwire(map  :vm_map_t;
+                        start:vm_offset_t;
+                        __end:vm_offset_t;
+                        flags:Integer):Integer;
 
-function vm_map_wire(map  :vm_map_t;
-                     start:vm_offset_t;
-                     __end:vm_offset_t;
-                     flags:Integer):Integer;
+function  vm_map_wire(map  :vm_map_t;
+                      start:vm_offset_t;
+                      __end:vm_offset_t;
+                      flags:Integer):Integer;
 
 function  vm_map_sync(map       :vm_map_t;
                       start     :vm_offset_t;
@@ -271,17 +287,18 @@ function  vm_map_sync(map       :vm_map_t;
                       invalidate:Boolean):Integer;
 
 function  vm_map_find(map       :vm_map_t;
-                      vm_obj    :vm_object_t;
+                      obj       :vm_object_t;
                       offset    :vm_ooffset_t;
                       addr      :p_vm_offset_t;
                       length    :vm_size_t;
                       find_space:Integer;
                       prot      :vm_prot_t;
                       max       :vm_prot_t;
-                      cow       :Integer;
+                      cow       :DWORD;
+                      flags     :DWORD;
                       anon      :Pointer):Integer;
 
-procedure vm_map_simplify_entry(map:vm_map_t;entry:vm_map_entry_t);
+procedure vm_map_simplify_entry(map:vm_map_t;entry:vm_map_entry_t;cow:DWORD=0);
 
 function  vm_map_fixed(map    :vm_map_t;
                        vm_obj :vm_object_t;
@@ -290,8 +307,8 @@ function  vm_map_fixed(map    :vm_map_t;
                        length :vm_size_t;
                        prot   :vm_prot_t;
                        max    :vm_prot_t;
-                       cow    :Integer;
-                       overwr :Boolean;
+                       flags  :DWORD;
+                       cow    :DWORD;
                        anon   :Pointer):Integer;
 
 function  vm_map_stack(map      :vm_map_t;
@@ -299,7 +316,7 @@ function  vm_map_stack(map      :vm_map_t;
                        max_ssize:vm_size_t;
                        prot     :vm_prot_t;
                        max      :vm_prot_t;
-                       cow      :Integer;
+                       cow      :DWORD;
                        anon     :Pointer):Integer;
 
 function  vm_map_growstack(map:vm_map_t;addr:vm_offset_t):Integer;
@@ -312,12 +329,13 @@ procedure vm_map_unlock (map:vm_map_t;def:Boolean=True);
 function  vm_map_lock_range  (map:vm_map_t;start,__end:off_t;mode:Integer):Pointer;
 procedure vm_map_unlock_range(map:vm_map_t;cookie:Pointer);
 
-function  vm_map_delete(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t;rmap_free:Boolean):Integer;
-function  vm_map_remove(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t):Integer;
+function  vm_map_delete(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t;cow:DWORD=0):Integer;
+function  vm_map_remove(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t;cow:DWORD=0):Integer;
+
+function  vm_map_expand(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t):Integer;
 
 procedure vm_map_set_name(map:vm_map_t;start,__end:vm_offset_t;name:PChar);
 procedure vm_map_set_name_locked(map:vm_map_t;start,__end:vm_offset_t;name:PChar);
-procedure vm_map_set_info_locked(map:vm_map_t;start,__end:vm_offset_t;name:PChar;i:vm_inherit_t);
 
 procedure vm_map_track_insert(map:vm_map_t;tobj:Pointer);
 procedure vm_map_track_remove(map:vm_map_t;tobj:Pointer);
@@ -335,14 +353,39 @@ procedure vminit; //SYSINIT
 implementation
 
 uses
+ uma,
  md_map,
  kern_proc,
  rmem_map,
  kern_budget;
 
+////
+
+function obj2dmem(obj:vm_object_t):Pointer; external;
+
+function dmem_map_set_mtype(map  :Pointer;
+                            start:DWORD;
+                            __end:DWORD;
+                            mtype:Integer;
+                            prot :Integer;
+                            flags:Integer):Integer; external;
+
+function dmem_includes_wbgarlic(map  :Pointer;
+                                start:DWORD;
+                                __end:DWORD):Boolean; external;
+
+////
+
 var
+ mapentzone:uma_zone_t;
+
  sgrowsiz:QWORD=vmparam.SGROWSIZ;
  stack_guard_page:Integer=0;
+
+function IDX_TO_OFF(x:QWORD):QWORD; inline;
+begin
+ Result:=QWORD(x) shl PAGE_SHIFT;
+end;
 
 function OFF_TO_IDX(x:QWORD):QWORD; inline;
 begin
@@ -398,7 +441,13 @@ end;
 
 function ENTRY_CHARGED(e:vm_map_entry_t):Boolean; inline;
 begin
- Result:=(e^.vm_obj<>nil) and ((e^.eflags and MAP_ENTRY_NEEDS_COPY)=0);
+ if (e^.vm_obj<>nil) and ((e^.eflags and MAP_ENTRY_NEEDS_COPY)=0) then
+ begin
+  Result:=(e^.vm_obj^.cred);
+ end else
+ begin
+  Result:=False;
+ end;
 end;
 
 function vmspace_pmap(vm:p_vmspace):pmap_t; inline;
@@ -441,10 +490,13 @@ begin
  begin
   map:=@vm^.vm_map;
   vm_map_lock(map);
-   For i:=0 to High(pmap_mem_guest)-1 do
+   //mark all space as hole
+   vm_map_insert(map, nil, 0, VM_MINUSER_ADDRESS, VM_MAXUSER_ADDRESS, 0, 0, MAP_COW_NO_BUDGET or MAP_COW_HOLE, nil);
+   //
+   For i:=0 to High(pmap_mem_guest) do
    begin
-    vm_map_insert         (map, nil, 0, pmap_mem_guest[i].__end, pmap_mem_guest[i+1].start, 0, 0, -1, nil, false, false);
-    vm_map_set_info_locked(map,         pmap_mem_guest[i].__end, pmap_mem_guest[i+1].start, '#hole', VM_INHERIT_HOLE);
+    //mark used regions as free
+    vm_map_delete(map ,pmap_mem_guest[i].start, pmap_mem_guest[i].__end, MAP_COW_HOLE);
    end;
   vm_map_unlock(map);
  end;
@@ -723,7 +775,7 @@ end;
  }
 procedure vm_map_entry_dispose(map:vm_map_t;entry:vm_map_entry_t); inline;
 begin
- FreeMem(entry);
+ uma_zfree(mapentzone, entry);
 end;
 
 {
@@ -736,7 +788,7 @@ function vm_map_entry_create(map:vm_map_t):vm_map_entry_t;
 var
  new_entry:vm_map_entry_t;
 begin
- new_entry:=AllocMem(SizeOf(vm_map_entry));
+ new_entry:=uma_zalloc(mapentzone, M_WAITOK);
  Assert((new_entry<>nil),'vm_map_entry_create: kernel resources exhausted');
  Result:=new_entry;
 end;
@@ -948,6 +1000,8 @@ var
 begin
  VM_MAP_ASSERT_LOCKED(map);
 
+ Assert(entry<>@map^.header);
+
  if (entry<>map^.root) then
  begin
   vm_map_entry_splay(entry^.start, map^.root);
@@ -1091,7 +1145,7 @@ begin
 
  if not alias then
  begin
-  if rmem_map_test(rmap,offset,offset+length,0) then
+  if rmem_map_test(rmap,offset,offset+length,rt_intersection) then
   begin
    rmem_map_unlock(rmap);
    Exit(KERN_NO_SPACE);
@@ -1132,31 +1186,42 @@ function vm_map_insert_internal(
            __end :vm_offset_t;
            prot  :vm_prot_t;
            max   :vm_prot_t;
-           cow   :Integer;
-           alias :Boolean):Integer;
+           cow   :DWORD):Integer;
+var
+ BLOCKPOOL:Boolean;
 begin
  Result:=KERN_SUCCESS;
 
- if (cow=-1) then Exit;
+ if ((cow and MAP_COW_HOLE)<>0) then
+ begin
+  Exit; //skip
+ end;
 
+ BLOCKPOOL:=False;
  if (obj<>nil) then
  begin
   if ((obj^.flags and OBJ_DMEM_EXT)<>0) or
      (obj^.otype=OBJT_PHYSHM) then
   begin
-   Result:=vm_object_rmap_insert(map,obj,start,__end,offset,alias);
+   Result:=vm_object_rmap_insert(map,obj,
+                                 start,__end,offset,
+                                 ((cow and MAP_COW_MMAP_DMEM)=0) or
+                                 ((p_proc.p_dmem_aliasing and 3)<>0)
+                                );
   end;
+  BLOCKPOOL:=(obj^.otype=OBJT_BLOCKPOOL);
  end;
 
  if (Result=KERN_SUCCESS) then
  begin
 
-  if (obj=nil) and (max=0) and (prot=0) then
+  if ((obj=nil) and (max=0) and (prot=0)) or
+     BLOCKPOOL then
   begin
-   //reserved only
+   //reserved or blockpool
 
    pmap_remove(map^.pmap,
-               obj,
+               nil,
                start,
                __end);
   end else
@@ -1181,6 +1246,74 @@ begin
 
 end;
 
+function vm_gpu_map_create(map:vm_map_t;entry:vm_map_entry_t):Integer;
+label
+ _gvmsw_map,
+ _budget;
+var
+ obj:vm_object_t;
+
+ function _inc(var count:Integer):Integer; inline;
+ begin
+  Result:=count;
+  Inc(count);
+ end;
+
+begin
+ Result:=0;
+
+ obj:=entry^.vm_obj;
+
+ if (obj<>nil) then
+ begin
+  if ((entry^.start shr 47)=0) and
+     ((obj^.flags and OBJ_DMEM_EXT)<>0) then
+  begin
+   _gvmsw_map:
+   //vm_gvmsw_map
+   Exit(0);
+  end;
+ end else
+ if (_inc(entry^.wired_count)<>0) then
+ begin
+  goto _gvmsw_map;
+ end;
+
+ if (obj<>nil) then
+ if ((obj^.flags and OBJ_WIRE_BUDGET)<>0) then
+ begin
+  //vm_budget_wire_action_jit
+  Exit(0);
+ end;
+
+ if (entry^.budget_id=-1) then
+ begin
+  //
+ end else
+ if (obj=nil) then
+ begin
+  _budget:
+
+  if (entry^.max_protection<>0) then
+  begin
+
+   if (vm_budget_reserve(entry^.budget_id,field_mlock,(entry^.__end - entry^.start))=0) then
+   begin
+    entry^.eflags:=entry^.eflags or MAP_ENTRY_WIRE_BUDGET;
+   end;
+
+  end;
+
+  Exit(0);
+ end else
+ if obj^.otype in [OBJT_DEFAULT,OBJT_SWAP,OBJT_VNODE,OBJT_JITSHM,OBJT_SELF] then
+ begin
+  goto _budget;
+ end;
+
+ //vm_map_wire_dmem
+end;
+
 {
  * vm_map_insert:
  *
@@ -1201,15 +1334,11 @@ function vm_map_insert(
            __end :vm_offset_t;
            prot  :vm_prot_t;
            max   :vm_prot_t;
-           cow   :Integer;
-           anon  :Pointer;
-           alias :Boolean;
-           naming:Boolean):Integer;
+           cow   :DWORD;
+           anon  :Pointer):Integer;
 label
  _budget,
  charged;
-const
- is_system_map=0;
 var
  td:p_kthread;
  new_entry  :vm_map_entry_t;
@@ -1219,6 +1348,7 @@ var
  inheritance:vm_inherit_t;
  charge_prev_obj:Boolean;
  budget_id  :shortint;
+ cred       :Boolean;
 begin
  VM_MAP_ASSERT_LOCKED(map);
 
@@ -1251,9 +1381,10 @@ begin
  end;
 
  protoeflags:=0;
- charge_prev_obj:=FALSE;
+ charge_prev_obj:=False;
+ cred:=False;
 
- protoeflags:=protoeflags or (cow and MAP_COW_NO_COALESCE);
+ protoeflags:=protoeflags or (cow and (MAP_COW_NO_COALESCE or MAP_COW_MMAP_DMEM));
 
  if ((cow and MAP_COPY_ON_WRITE)<>0) then
  begin
@@ -1282,23 +1413,34 @@ begin
   protoeflags:=protoeflags or MAP_ENTRY_VN_WRITECNT;
  end;
 
- if ((cow and MAP_INHERIT_SHARE)<>0) then
-  inheritance:=VM_INHERIT_SHARE
- else
+ if ((cow and MAP_COW_HOLE)<>0) then
+ begin
+  //emu ext
+  inheritance:=VM_INHERIT_HOLE;
+ end else
+ if ((cow and MAP_COW_PATCH)<>0) then
+ begin
+  //emu ext
+  inheritance:=VM_INHERIT_PATCH;
+ end else
+ begin
+  //The original fw will only initialize as 1
   inheritance:=VM_INHERIT_DEFAULT;
+ end;
 
  if ((cow and (MAP_ACC_NO_CHARGE or MAP_NOFAULT))<>0) then
  begin
   goto charged;
  end;
 
- if ((cow and MAP_ACC_CHARGED)<>0) or (((prot and VM_PROT_WRITE)<>0) and
-     (((protoeflags and MAP_ENTRY_NEEDS_COPY)<>0) or (obj=nil))) then
+ if ((cow and MAP_ACC_CHARGED)<>0) or
+    (
+     ((prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))<>0) and
+     (((protoeflags and MAP_ENTRY_NEEDS_COPY)<>0) or (obj=nil))
+    ) then
  begin
-  if (obj=nil) and ((protoeflags and MAP_ENTRY_NEEDS_COPY)=0) then
-  begin
-   charge_prev_obj:=TRUE;
-  end;
+  cred:=True;
+  charge_prev_obj:=(obj=nil) and ((protoeflags and MAP_ENTRY_NEEDS_COPY)=0);
  end;
 
 charged:
@@ -1306,10 +1448,10 @@ charged:
  if (obj=nil) then
  begin
   //vm_container:=0;
-  if ((cow and MAP_COW_SYSTEM)<>0) or (is_system_map<>0) then
+  if ((cow and MAP_COW_SYSTEM)<>0) or (map^.system_map<>0) then
   begin
    budget_id:=-1;
-   if (is_system_map=0) then
+   if (map^.system_map=0) then
    begin
     budget_id:=PTYPE_SYSTEM;
     if ((cow and MAP_COW_SYSTEM)=0) then
@@ -1330,7 +1472,7 @@ charged:
  begin
   //vm_container:=obj^.vm_container;
   budget_id:=-1;
-  if (is_system_map=0) then
+  if (map^.system_map=0) then
   begin
    budget_id:=obj^.budget_id;
   end;
@@ -1341,11 +1483,6 @@ charged:
     ((cow and MAP_COW_NO_BUDGET)<>0) or
     (budget_id=-1) then
  begin
-  budget_id:=-1;
- end else
- if (budget_id=PTYPE_SYSTEM) then
- begin
-  //ignore system
   budget_id:=-1;
  end else
  if (obj=nil) then
@@ -1384,11 +1521,12 @@ charged:
   VM_OBJECT_UNLOCK(obj);
  end else
  if ((prev_entry<>@map^.header) and
-   (prev_entry^.eflags=protoeflags) and
-   ((cow and (MAP_ENTRY_GROWS_DOWN or MAP_ENTRY_GROWS_UP or MAP_COW_NO_COALESCE))=0) and
-   (prev_entry^.__end=start) and
+   (prev_entry^.eflags     =protoeflags) and
+   ((cow and (MAP_ENTRY_GROWS_DOWN or MAP_ENTRY_GROWS_UP))=0) and
+   (prev_entry^.__end      =start) and
    (prev_entry^.wired_count=0) and
-   (prev_entry^.budget_id=p_proc.p_budget_ptype) and
+   (prev_entry^.budget_id  =budget_id) and
+   (prev_entry^.cred       =cred) and
      vm_object_coalesce(prev_entry^.vm_obj,
          prev_entry^.offset,
          vm_size_t(prev_entry^.__end - prev_entry^.start),
@@ -1399,13 +1537,11 @@ charged:
    * can extend the previous map entry to include the
    * new range as well.
    }
-  if ((prev_entry^.inheritance=inheritance) and
-      (prev_entry^.protection=prot) and
-      (prev_entry^.max_protection=max)) then
+  if ((cow and MAP_COW_NO_COALESCE)=0) and
+     (prev_entry^.inheritance   =inheritance) and
+     (prev_entry^.protection    =prot) and
+     (prev_entry^.max_protection=max) then
   begin
-   map^.size:=map^.size+(__end - prev_entry^.__end);
-   prev_entry^.__end:=__end;
-   //change size
 
    Result:=vm_map_insert_internal(
               map   ,
@@ -1415,13 +1551,26 @@ charged:
               __end ,
               prot  ,
               max   ,
-              cow   ,
-              alias);
+              cow
+           );
 
    if (Result=KERN_SUCCESS) then
    begin
+    map^.size:=map^.size+(__end - prev_entry^.__end);
+    prev_entry^.__end:=__end;
+    //change size
+
     vm_map_entry_resize_free(map, prev_entry);
     vm_map_simplify_entry(map, prev_entry);
+   end else
+   begin
+    //free budget
+    if (budget_id<>-1) and
+       ((protoeflags and MAP_ENTRY_IN_BUDGET)<>0) then
+    begin
+     vm_budget_release(budget_id,field_malloc,__end-start);
+    end;
+    //free budget
    end;
 
    Exit;
@@ -1436,10 +1585,13 @@ charged:
   obj:=prev_entry^.vm_obj;
   offset:=prev_entry^.offset + (prev_entry^.__end - prev_entry^.start);
   vm_object_reference(obj);
-  if (obj<>nil) and
-     ((prev_entry^.eflags and MAP_ENTRY_NEEDS_COPY)=0) then
+
+  if ((prev_entry^.eflags and MAP_ENTRY_NEEDS_COPY)=0) then
+  if (cred) and (obj<>nil) then
+  if (obj^.cred) then
   begin
    { Object already accounts for this uid. }
+   cred:=False;
   end;
  end;
 
@@ -1472,8 +1624,17 @@ charged:
  Inc(map^.entry_id);
 
  new_entry^.anon_addr:=anon;
+ new_entry^.cred     :=cred;
 
- if naming then
+ if ((cow and MAP_COW_HOLE)<>0) then
+ begin
+  new_entry^.name:='#hole';
+ end else
+ if ((cow and MAP_COW_PATCH)<>0) then
+ begin
+  new_entry^.name:='#patch';
+ end else
+ if ((cow and MAP_COW_AUTO_NAMING)<>0) then
  begin
   td:=curkthread;
   if (td<>nil) then
@@ -1494,6 +1655,12 @@ charged:
  vm_map_entry_link(map, prev_entry, new_entry);
  map^.size:=map^.size+(new_entry^.__end - new_entry^.start);
 
+ if ((prot and VM_PROT_GPU_ALL)<>0) and
+    ((obj=nil) or ((obj^.otype<>OBJT_BLOCKPOOL))) then //(not BLOCKPOOL)
+ begin
+  vm_gpu_map_create(map,new_entry);
+ end;
+
  {
   * It may be possible to merge the new entry with the next and/or
   * previous entries.  However, due to MAP_STACK_* being a hack, a
@@ -1512,8 +1679,8 @@ charged:
             __end ,
             prot  ,
             max   ,
-            cow   ,
-            alias);
+            cow
+         );
 
  if (Result<>KERN_SUCCESS) then
  begin
@@ -1573,7 +1740,7 @@ begin
   * must be a gap from start to the root.
   }
  map^.root:=vm_map_entry_splay(start, map^.root);
- if (start + length<=map^.root^.start) then
+ if ((start + length)<=map^.root^.start) then
  begin
   addr^:=start;
   Exit(0);
@@ -1609,7 +1776,37 @@ begin
 
  if (length>entry^.max_free) then
  begin
-  Exit(1);
+
+  if (entry^.inheritance=VM_INHERIT_HOLE) and
+     (entry^.start>=VM_MAXGUEST_ADDRESS) then
+  begin
+
+   if (entry^.start>start) then
+   begin
+    start:=entry^.start;
+   end;
+
+   if (start + length)<=(entry^.__end) then
+   begin
+    addr^:=start;
+    Exit(0);
+   end;
+
+   st:=(entry^.__end - start);
+
+   start :=start +st;
+   length:=length-st;
+
+   if (length>entry^.max_free) then
+   begin
+    Exit(1);
+   end;
+
+  end else
+  begin
+   Exit(1);
+  end;
+
  end;
 
  {
@@ -1648,21 +1845,59 @@ function vm_map_fixed(map    :vm_map_t;
                       length :vm_size_t;
                       prot   :vm_prot_t;
                       max    :vm_prot_t;
-                      cow    :Integer;
-                      overwr :Boolean;
+                      flags  :DWORD;
+                      cow    :DWORD;
                       anon   :Pointer):Integer;
 var
  __end:vm_offset_t;
 begin
  __end:=start + length;
+
+ if (start<vm_map_min(map)) or
+    (start>__end) or
+    (__end>vm_map_max(map)) then
+ begin
+  Exit(KERN_INVALID_ARGUMENT);
+ end;
+
+ if ((start shr 47)=0) and
+    ((flags and MAP_SANITIZER)=0) and
+    (
+     (DWORD(start shr 34) > 62) or
+     (__end > MAP_AREA_END)
+    ) and
+    (p_proc.p_sdk_version >= $3000000) then
+ begin
+  Exit(KERN_INVALID_ARGUMENT);
+ end;
+
  vm_map_lock(map);
-  VM_MAP_RANGE_CHECK(map, start, __end);
-  if (overwr) then
+
+  //try to expand addres space
+  vm_map_expand(map, start, __end);
+
+  if ((flags and MAP_NO_OVERWRITE)=0) then
   begin
-   vm_map_delete(map, start, __end, True);
+   vm_map_delete(map, start, __end, cow);
   end;
-  Result:=vm_map_insert(map, vm_obj, offset, start, __end, prot, max, cow, anon, false, true);
+
+  Result:=vm_map_insert(map, vm_obj, offset, start, __end, prot, max, cow or MAP_COW_AUTO_NAMING, anon);
  vm_map_unlock(map);
+end;
+
+function vm_get_findspace_range(addr:vm_offset_t):p_addr_range; inline;
+var
+ i:Byte;
+begin
+ Result:=nil;
+ For i:=0 to High(vm_findspace_ranges) do
+ begin
+  if (vm_findspace_ranges[i].start<=addr) and
+     (vm_findspace_ranges[i].__end> addr) then
+  begin
+   Exit(@vm_findspace_ranges[i]);
+  end;
+ end;
 end;
 
 {
@@ -1675,75 +1910,179 @@ end;
  * prior to making call to account for the new entry.
  }
 function vm_map_find(map       :vm_map_t;
-                     vm_obj    :vm_object_t;
+                     obj       :vm_object_t;
                      offset    :vm_ooffset_t;
                      addr      :p_vm_offset_t;
                      length    :vm_size_t;
                      find_space:Integer;
                      prot      :vm_prot_t;
                      max       :vm_prot_t;
-                     cow       :Integer;
+                     cow       :DWORD;
+                     flags     :DWORD;
                      anon      :Pointer):Integer;
 label
- again;
+ _ending,
+ _insert;
 var
- alignment,initial_addr,start:vm_offset_t;
+ i           :Byte;
+ align_2mb   :Boolean;
+ r           :Integer;
+ alignment   :vm_offset_t;
+ initial_addr:vm_offset_t;
+ start       :vm_offset_t;
+ tmp         :vm_offset_t;
+ range       :p_addr_range;
 begin
- if (find_space=VMFS_OPTIMAL_SPACE) then
+ align_2mb:=(flags and MAP_2MB_ALIGN)<>0;
+
+ if (not align_2mb) or (find_space<>VMFS_ANY_SPACE) then
  begin
-  if (vm_obj=nil) then
-  begin
-   find_space:=VMFS_ANY_SPACE;
-  end else
-  if ((vm_obj^.flags and OBJ_COLORED)=0) then
-  begin
-   find_space:=VMFS_ANY_SPACE;
-  end;
- end;
- if ((find_space shr 8)<>0) then
- begin
-  Assert((find_space and $ff)=0,'bad VMFS flags');
-  alignment:=vm_offset_t(1) shl (find_space shr 8);
+  initial_addr:=addr^;
  end else
  begin
-  alignment:=0;
+  initial_addr:=(addr^ + PAGE_2MB_MASK) and QWORD(not PAGE_2MB_MASK);
  end;
- initial_addr:=addr^;
-again:
- start:=initial_addr;
+
+ alignment:=QWORD(-1) shl (find_space and $3f);
+
  vm_map_lock(map);
+
  repeat
+  start:=initial_addr;
+
   if (find_space<>VMFS_NO_SPACE) then
   begin
-   if (vm_map_findspace(map, start, length, addr)<>0) then
-   begin
-    vm_map_unlock(map);
-    if (find_space=VMFS_OPTIMAL_SPACE) then
-    begin
-     find_space:=VMFS_ANY_SPACE;
-     goto again;
-    end;
-    Exit(KERN_NO_SPACE);
-   end;
 
-   case find_space of
-    VMFS_SUPER_SPACE,
-    VMFS_OPTIMAL_SPACE: pmap_align_superpage(vm_obj, offset, addr, length);
-    VMFS_ANY_SPACE:;
-   else
-    if ((addr^ and (alignment - 1))<>0) then
-    begin
-     addr^:=addr^ and (not (alignment - 1));
-     addr^:=addr^ + alignment;
-    end;
-   end;
+   repeat
 
-   start:=addr^;
-  end;
-  Result:=vm_map_insert(map, vm_obj, offset, start, start + length, prot, max, cow, anon, false, true);
- until not ((Result=KERN_NO_SPACE) and
-            (find_space<>VMFS_NO_SPACE) and
-            (find_space<>VMFS_ANY_SPACE));
+    if (vm_map_findspace(map, start, length, addr)<>0) then
+    begin
+     vm_map_unlock(map);
+     Exit(KERN_NO_SPACE);
+    end;
+
+    if (not align_2mb) or (find_space<>VMFS_ANY_SPACE) then
+    begin
+     start:=initial_addr;
+
+     if (find_space=VMFS_OPTIMAL_SPACE) or (find_space=VMFS_OPTIMAL_SUPER) then
+     begin
+
+      if (initial_addr < $400000) then //SCE_KERNEL_PROC_IMAGE_AREA
+      begin
+       vm_map_unlock(map);
+       Exit(22);
+      end;
+
+      tmp:=addr^;
+
+      range:=vm_get_findspace_range(initial_addr);
+      if (range=nil) then
+      begin
+       vm_map_unlock(map);
+       Exit(22);
+      end;
+
+      For i:=0 to 9 do
+      begin
+       //TODO:ASLR
+
+       r:=vm_map_findspace(map, range^.start, range^.__end, addr);
+
+       //align_2mb
+
+       if (r=0) and
+          ((not align_2mb) or
+           ((addr^ and PAGE_2MB_MASK)=0)) then
+       begin
+        goto _ending;
+       end;
+
+      end; //for
+
+      if (r<>0) then
+      begin
+       addr^:=tmp;
+      end;
+
+     end; //[VMFS_OPTIMAL_SPACE, VMFS_OPTIMAL_SUPER]
+
+     _ending:
+
+      if (start - QWORD($200000000) <= QWORD($500000000)) then //SCE_KERNEL_HEAP_AREA
+      begin
+       if (SCE_USR_HEAP_END <= addr^) then
+       begin
+        vm_map_unlock(map);
+        Exit(KERN_NO_SPACE);
+       end;
+      end else
+      if ((start shr 47)=0) and
+         ((flags and MAP_SANITIZER)=0) and
+         (
+          (DWORD(start shr 34) > 62) or
+          ((start + length) > MAP_AREA_END)
+         ) and
+         (p_proc.p_sdk_version >= $3000000) then
+      begin
+       vm_map_unlock(map);
+       Exit(KERN_NO_SPACE);
+      end;
+
+      //
+
+      if (find_space=VMFS_OPTIMAL_SUPER) or (find_space=VMFS_SUPER_SPACE) then
+      begin
+       pmap_align_superpage(obj, offset, addr, length);
+      end else
+      if (Integer(find_space) > 13) then
+      begin
+       addr^:=(addr^ + (not alignment)) and alignment;
+      end;
+      initial_addr:=addr^;
+
+      goto _insert;
+
+    end else // (not align_2mb) or (find_space<>VMFS_ANY_SPACE)
+    begin
+     //Any 2MB block
+
+     tmp:=addr^;
+     if (tmp < QWORD($80000000)) or               //SCE_KERNEL_PROC_IMAGE_AREA
+        (QWORD($1ffffffff) < (length + tmp)) then
+     begin
+      vm_map_unlock(map);
+      Exit(KERN_NO_SPACE);
+     end;
+
+     if ((tmp and PAGE_2MB_MASK)=0) then
+     begin
+      goto _ending;
+     end;
+
+     start:=(tmp + PAGE_2MB_MASK) and QWORD(not PAGE_2MB_MASK);
+    end;
+   until false;
+
+  end; // (find_space<>VMFS_NO_SPACE)
+
+  _insert:
+
+   //try to expand addres space
+   vm_map_expand(map, initial_addr, initial_addr + length);
+
+   Result:=vm_map_insert(map, obj,
+                         offset,
+                         initial_addr,
+                         initial_addr + length,
+                         prot, max,
+                         cow or MAP_COW_AUTO_NAMING,
+                         anon);
+
+ until ((Integer(find_space) <= 14) and (find_space <> VMFS_SUPER_SPACE)) or
+       (Result <> KERN_NO_SPACE);
+
+
  vm_map_unlock(map);
 end;
 
@@ -1759,24 +2098,36 @@ end;
  * possibly extended).  When merging, this routine may delete one or
  * both neighbors.
  }
-procedure vm_map_simplify_entry(map:vm_map_t;entry:vm_map_entry_t);
+procedure vm_map_simplify_entry(map:vm_map_t;entry:vm_map_entry_t;cow:DWORD=0);
 var
  next,prev:vm_map_entry_t;
  prevsize,esize:vm_size_t;
  obj:vm_map_object;
- sdk_5:Boolean;
+ eflags:vm_eflags_t;
+ sdk_55:Boolean;
+ coal  :Boolean;
 begin
- if ((entry^.eflags and (MAP_ENTRY_IS_SUB_MAP or MAP_ENTRY_IN_TRANSITION or MAP_ENTRY_IN_TRANSITION2))<>0) or
-    (entry^.inheritance=VM_INHERIT_HOLE) then
+ eflags:=entry^.eflags;
+
+ if ((eflags and (MAP_ENTRY_IS_SUB_MAP or
+                  MAP_ENTRY_IN_TRANSITION or
+                  MAP_ENTRY_IN_TRANSITION2))<>0) or
+     (
+      (entry^.inheritance=VM_INHERIT_HOLE) and
+      ((cow and MAP_COW_HOLE)<>0)
+     ) then
  begin
   Exit;
  end;
+
+ //hack for flex memory
+ if entry^.cred then Exit;
 
  obj:=entry^.vm_obj;
 
  if (obj<>nil) then
  begin
-  if (p_proc.p_sdk_version<=$1ffffff) and
+  if (p_proc.p_sdk_version < $2000000) and
      ((obj^.flags and OBJ_DMEM_EXT)<>0) then
   begin
    Exit;
@@ -1787,29 +2138,32 @@ begin
   end;
  end;
 
- sdk_5:=(p_proc.p_sdk_version>$54fffff);
+ sdk_55:=(p_proc.p_sdk_version >= $5500000);
 
  prev:=entry^.prev;
  if (prev<>@map^.header) then
  begin
+  coal:=((eflags and MAP_ENTRY_NO_COALESCE)=0);
+
   prevsize:=prev^.__end - prev^.start;
   if (prev^.__end=entry^.start) and
      (prev^.vm_obj=obj) and
-     ((prev^.vm_obj=nil) or (prev^.offset + prevsize=entry^.offset)) and
-     (prev^.eflags=entry^.eflags) and
-     (prev^.protection=entry^.protection) and
+     ((obj=nil) or (prev^.offset + prevsize=entry^.offset)) and
+     (prev^.eflags=eflags) and
+     (prev^.protection    =entry^.protection) and
      (prev^.max_protection=entry^.max_protection) and
-     (prev^.inheritance=entry^.inheritance) and
-     (prev^.wired_count=entry^.wired_count) and
-     (prev^.budget_id=entry^.budget_id) and
-     (sdk_5 or (prev^.anon_addr=entry^.anon_addr)) and
-     (((prev^.eflags and MAP_ENTRY_NO_COALESCE)=0) or (prev^.entry_id=entry^.entry_id))
+     (prev^.inheritance   =entry^.inheritance) and
+     (prev^.wired_count   =entry^.wired_count) and
+     (prev^.cred          =entry^.cred) and
+     (prev^.budget_id     =entry^.budget_id) and
+     (sdk_55 or (prev^.anon_addr=entry^.anon_addr)) and
+     (coal or (prev^.entry_id=entry^.entry_id))
      then
   begin
    if (strlcomp(pchar(@prev^.name),pchar(@entry^.name),32)=0) then
    begin
     vm_map_entry_unlink(map, prev);
-    entry^.start:=prev^.start;
+    entry^.start :=prev^.start;
     entry^.offset:=prev^.offset;
     //change
     if (entry^.prev<>@map^.header) then
@@ -1840,18 +2194,22 @@ begin
  next:=entry^.next;
  if (next<>@map^.header) then
  begin
+  eflags:=next^.eflags;
+  coal:=((eflags and MAP_ENTRY_NO_COALESCE)=0);
+
   esize:=entry^.__end - entry^.start;
   if (entry^.__end=next^.start) and
      (next^.vm_obj=obj) and
      ((obj=nil) or (entry^.offset + esize=next^.offset)) and
-     (next^.eflags=entry^.eflags) and
-     (next^.protection=entry^.protection) and
+     (eflags=entry^.eflags) and
+     (next^.protection    =entry^.protection) and
      (next^.max_protection=entry^.max_protection) and
-     (next^.inheritance=entry^.inheritance) and
-     (next^.wired_count=entry^.wired_count) and
-     (next^.budget_id=entry^.budget_id) and
-     (sdk_5 or (next^.anon_addr=entry^.anon_addr)) and
-     (((entry^.eflags and MAP_ENTRY_NO_COALESCE)=0) or (next^.entry_id=entry^.entry_id))
+     (next^.inheritance   =entry^.inheritance) and
+     (next^.wired_count   =entry^.wired_count) and
+     (next^.cred          =entry^.cred) and
+     (next^.budget_id     =entry^.budget_id) and
+     (sdk_55 or (next^.anon_addr=entry^.anon_addr)) and
+     (coal or (next^.entry_id=entry^.entry_id))
      then
   begin
    if (strlcomp(pchar(@next^.name),pchar(@entry^.name),32)=0) then
@@ -1885,12 +2243,48 @@ begin
   }
  vm_map_simplify_entry(map, entry);
 
+ {
+  * If there is no object backing this entry, we might as well create
+  * one now.  If we defer it, an object can get created after the map
+  * is clipped, and individual objects will be created for the split-up
+  * map.  This is a bit of a hack, but is also about the best place to
+  * put this improvement.
+ }
+ if not (entry^.inheritance in [VM_INHERIT_PATCH,VM_INHERIT_HOLE]) then
+ begin
+  if (entry^.vm_obj=nil) then
+  begin
+   if (map^.system_map=0) then
+   begin
+    entry^.vm_obj:=vm_object_allocate(OBJT_DEFAULT,atop(entry^.__end - entry^.start));
+    entry^.offset:=0;
+    if (entry^.cred) then
+    begin
+     entry^.vm_obj^.cred  :=entry^.cred;
+     entry^.vm_obj^.charge:=(entry^.__end - entry^.start);
+     entry^.cred:=False;
+    end;
+   end;
+  end else
+  begin
+   if ((entry^.eflags and MAP_ENTRY_NEEDS_COPY) = 0) and
+      (entry^.cred) then
+   begin
+    VM_OBJECT_LOCK(entry^.vm_obj);
+     entry^.vm_obj^.cred  :=entry^.cred;
+     entry^.vm_obj^.charge:=(entry^.__end - entry^.start);
+    VM_OBJECT_UNLOCK(entry^.vm_obj);
+    entry^.cred:=False;
+   end;
+  end;
+ end;
+
  new_entry:=vm_map_entry_create(map);
  new_entry^:=entry^;
 
  new_entry^.__end:=start;
  entry^.offset:=entry^.offset + (start - entry^.start);
- entry^.start:=start;
+ entry^.start :=start;
 
  vm_map_entry_link(map, entry^.prev, new_entry);
 
@@ -1933,6 +2327,43 @@ var
  new_entry:vm_map_entry_t;
 begin
  VM_MAP_ASSERT_LOCKED(map);
+
+ {
+  * If there is no object backing this entry, we might as well create
+  * one now.  If we defer it, an object can get created after the map
+  * is clipped, and individual objects will be created for the split-up
+  * map.  This is a bit of a hack, but is also about the best place to
+  * put this improvement.
+ }
+ if not (entry^.inheritance in [VM_INHERIT_PATCH,VM_INHERIT_HOLE]) then
+ begin
+  if (entry^.vm_obj=nil) then
+  begin
+   if (map^.system_map=0) then
+   begin
+    entry^.vm_obj:=vm_object_allocate(OBJT_DEFAULT,atop(entry^.__end - entry^.start));
+    entry^.offset:=0;
+    if (entry^.cred) then
+    begin
+     entry^.vm_obj^.cred  :=entry^.cred;
+     entry^.vm_obj^.charge:=(entry^.__end - entry^.start);
+     entry^.cred:=False;
+    end;
+   end;
+  end else
+  begin
+   if ((entry^.eflags and MAP_ENTRY_NEEDS_COPY) = 0) and
+      (entry^.cred) then
+   begin
+    VM_OBJECT_LOCK(entry^.vm_obj);
+     entry^.vm_obj^.cred  :=entry^.cred;
+     entry^.vm_obj^.charge:=(entry^.__end - entry^.start);
+    VM_OBJECT_UNLOCK(entry^.vm_obj);
+    entry^.cred:=False;
+   end;
+  end;
+ end;
+
 
  {
   * Create a new entry and insert it AFTER the specified entry
@@ -1980,14 +2411,15 @@ type
  t_prot_action=(paNone,paEnter,paRemove,paProtect);
 
 procedure vm_map_protect_internal(map  :vm_map_t;
-                                  entry:vm_map_entry_t;
-                                  prev :vm_prot_t);
+                                  obj  :vm_object_t;
+                                  start:vm_offset_t;
+                                  __end:vm_offset_t;
+                                  prev :vm_prot_t;
+                                  prot :vm_prot_t);
 var
- prot:vm_prot_t;
  nt_action:t_prot_action;
  gp_action:t_prot_action;
 begin
- prot:=entry^.protection and MASK(entry);
 
  //magic time
  nt_action:=t_prot_action(
@@ -2016,9 +2448,9 @@ begin
  if (nt_action=paProtect) then
  begin
   pmap_protect(map^.pmap,
-               entry^.vm_obj,
-               entry^.start,
-               entry^.__end,
+               obj,
+               start,
+               __end,
                prot);
  end;
 
@@ -2026,26 +2458,42 @@ begin
   paEnter:
     begin
      pmap_gpu_enter_object(map^.pmap,
-                           entry^.start,
-                           entry^.__end,
+                           start,
+                           __end,
                            prot);
     end;
   paRemove:
     begin
      pmap_gpu_remove(map^.pmap,
-                     entry^.start,
-                     entry^.__end);
+                     start,
+                     __end);
     end;
   paProtect:
     begin
      pmap_gpu_protect(map^.pmap,
-                      entry^.start,
-                      entry^.__end,
+                      start,
+                      __end,
                       prot);
     end;
   else;
  end;
 
+end;
+
+procedure vm_map_protect_internal(map  :vm_map_t;
+                                  entry:vm_map_entry_t;
+                                  prev :vm_prot_t); inline;
+var
+ prot:vm_prot_t;
+begin
+ prot:=entry^.protection and MASK(entry);
+
+ vm_map_protect_internal(map,
+                         entry^.vm_obj,
+                         entry^.start,
+                         entry^.__end,
+                         prev ,
+                         prot);
 end;
 
 {
@@ -2062,11 +2510,19 @@ function vm_map_protect(map     :vm_map_t;
                         new_prot:vm_prot_t;
                         set_max :Boolean):Integer;
 label
- _continue;
+ _continue_1,
+ _continue_2,
+ _continue_3;
 var
  current,entry:vm_map_entry_t;
  obj:vm_object_t;
+ max_prot:vm_prot_t;
  old_prot:vm_prot_t;
+ b_start :vm_offset_t;
+ b___end :vm_offset_t;
+ vm_start:vm_offset_t;
+ length  :vm_offset_t;
+ dmem:Pointer;
 const
  flags_2mb=0;
 begin
@@ -2087,6 +2543,12 @@ begin
   entry:=entry^.next;
  end;
 
+ if (entry=@map^.header) then
+ begin
+  vm_map_unlock(map);
+  Exit(KERN_SUCCESS);
+ end;
+
  {
   * Make a first pass to check for protection violations.
   }
@@ -2094,8 +2556,12 @@ begin
  while ((current<>@map^.header) and (current^.start<__end)) do
  begin
 
-  if ((current^.eflags and MAP_ENTRY_IS_SUB_MAP)<>0) or
-     (current^.inheritance=VM_INHERIT_HOLE) then
+  if (current^.inheritance=VM_INHERIT_HOLE) then
+  begin
+   goto _continue_1;
+  end;
+
+  if ((current^.eflags and MAP_ENTRY_IS_SUB_MAP)<>0) then
   begin
    vm_map_unlock(map);
    Exit(KERN_INVALID_ARGUMENT);
@@ -2115,25 +2581,73 @@ begin
 
   //flags_2mb:=current^.flags_2mb;
 
-  old_prot:=current^.max_protection and VM_PROT_GPU_ALL;
+  max_prot:=current^.max_protection and VM_PROT_GPU_ALL;
 
   if ((flags_2mb and 2) = 0) then
   begin
-   old_prot:=current^.max_protection;
+   max_prot:=current^.max_protection;
   end;
 
   if ((flags_2mb and 1) <> 0) then
   begin
-   old_prot:=0;
+   max_prot:=0;
   end;
 
-  if ((new_prot and old_prot)<>new_prot) then
+  //For some reason this check doesn't work?
+  //if ((new_prot and max_prot)<>new_prot) then
+  //begin
+  // vm_map_unlock(map);
+  // Exit(KERN_PROTECTION_FAILURE);
+  //end;
+
+  obj:=current^.vm_obj;
+
+  if (obj<>nil) then
+  if ((obj^.flags and OBJ_DMEM_EXT)<>0) then
   begin
-   vm_map_unlock(map);
-   Exit(KERN_PROTECTION_FAILURE);
+   if ((new_prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE)) <> 0) then
+   begin
+    //
+    if (start < current^.start) then
+    begin
+     b_start:=current^.start;
+    end else
+    begin
+     b_start:=start;
+    end;
+    //
+    if (__end <= current^.__end) then
+    begin
+     b___end:=__end;
+    end else
+    begin
+     b___end:=current^.__end;
+    end;
+    //
+    if (b_start < b___end) then
+    begin
+     //convert to offset
+     length:=b___end-b_start;
+     b_start:=current^.offset+(b_start-current^.start);
+     b___end:=b_start+length;
+
+     dmem:=obj2dmem(obj);
+
+     if dmem_includes_wbgarlic(dmem,
+                               OFF_TO_IDX(b_start),
+                               OFF_TO_IDX(b___end)) then
+     begin
+      vm_map_unlock(map);
+      Exit(KERN_PROTECTION_FAILURE);
+     end;
+
+    end;
+   end;
+   //
   end;
 
-  current:=current^.next;
+  _continue_1:
+   current:=current^.next;
  end;
 
  {
@@ -2145,13 +2659,18 @@ begin
  while (current<>@map^.header) and (current^.start<__end) do
  begin
 
+  if (current^.inheritance=VM_INHERIT_HOLE) then
+  begin
+   goto _continue_2;
+  end;
+
   vm_map_clip_end(map, current, __end);
 
   if set_max or
-     (((new_prot and (not current^.protection)) and VM_PROT_WRITE)=0) or
+     (((new_prot and (not current^.protection)) and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))=0) or
      ENTRY_CHARGED(current) then
   begin
-   goto _continue;
+   goto _continue_2;
   end;
 
   obj:=current^.vm_obj;
@@ -2159,20 +2678,24 @@ begin
   if (obj=nil) or ((current^.eflags and MAP_ENTRY_NEEDS_COPY)<>0) then
   begin
    //swap_reserve
-   goto _continue;
+   current^.cred:=True;
+   goto _continue_2;
   end;
 
   VM_OBJECT_LOCK(obj);
-  if (obj^.otype<>OBJT_DEFAULT) then
+  if (obj^.otype<>OBJT_DEFAULT) and (obj^.otype<>OBJT_SWAP) then
   begin
    VM_OBJECT_UNLOCK(obj);
-   goto _continue;
+   goto _continue_2;
   end;
+
+  obj^.cred  :=True;
+  obj^.charge:=ptoa(obj^.size);
 
   VM_OBJECT_UNLOCK(obj);
 
-  _continue:
-  current:=current^.next;
+  _continue_2:
+   current:=current^.next;
  end;
 
  {
@@ -2182,6 +2705,50 @@ begin
  current:=entry;
  while ((current<>@map^.header) and (current^.start<__end)) do
  begin
+
+  if (current^.inheritance=VM_INHERIT_HOLE) then
+  begin
+   goto _continue_3;
+  end;
+
+  obj:=current^.vm_obj;
+
+  if (obj<>nil) then
+  if (obj^.otype=OBJT_BLOCKPOOL) then
+  begin
+
+   if (start < current^.start) then
+   begin
+    b_start:=current^.start;
+   end else
+   begin
+    b_start:=start;
+   end;
+   b_start:=(b_start + M_64K - 1) and (not (M_64K - 1));
+
+   if (__end <= current^.__end) then
+   begin
+    b___end:=__end;
+   end else
+   begin
+    b___end:=current^.__end;
+   end;
+   b___end:=b___end and (not (M_64K - 1));
+
+   if (b_start < b___end) then
+   begin
+    vm_start:=current^.start - current^.offset;
+
+    blockpool_type_protect(map,obj,vm_start,
+                          (b_start - vm_start) div M_64K,
+                          (b___end - vm_start) div M_64K,
+                          DWORD(-1),new_prot);
+
+   end;
+
+   goto _continue_3;
+  end;
+
   old_prot:=current^.protection;
 
   if set_max then
@@ -2194,51 +2761,35 @@ begin
   end;
 
   if ((current^.eflags and (MAP_ENTRY_COW or MAP_ENTRY_USER_WIRED))=(MAP_ENTRY_COW or MAP_ENTRY_USER_WIRED)) and
-     ((current^.protection and VM_PROT_WRITE)<>0) and
-     ((old_prot and VM_PROT_WRITE)=0) then
+     ((current^.protection and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))<>0) and
+     ((old_prot and (VM_PROT_WRITE or VM_PROT_GPU_WRITE))=0) then
   begin
    //vm_fault_copy_entry(map, map, current, current, nil);
   end;
 
-  {
-   * When restricting access, update the physical map.  Worry
-   * about copy-on-write here.
-   }
   vm_map_protect_internal(map,current,old_prot);
 
   vm_map_simplify_entry(map, current);
-  current:=current^.next;
+
+  _continue_3:
+   current:=current^.next;
  end;
 
  vm_map_unlock(map);
  Result:=(KERN_SUCCESS);
 end;
 
-////
-
-const
- SCE_KERNEL_WB_GARLIC =10;
-
-function obj2dmem(obj:vm_object_t):Pointer; external;
-
-function dmem_map_set_mtype(map  :Pointer;
-                            start:DWORD;
-                            __end:DWORD;
-                            mtype:Integer;
-                            prot :Integer;
-                            flags:Integer):Integer; external;
-
-//
-
 function vm_map_type_protect(map      :vm_map_t;
                              start    :vm_offset_t;
                              __end    :vm_offset_t;
                              new_mtype:Integer;
                              new_prot :vm_prot_t):Integer;
+label
+ _continue_1,
+ _continue_2;
 var
  rmap:p_rmem_map;
  dmem:Pointer;
-
  current,entry:vm_map_entry_t;
  obj:vm_object_t;
  old_prot:vm_prot_t;
@@ -2274,8 +2825,27 @@ begin
  if (obj<>nil) then
  if (obj^.otype=OBJT_BLOCKPOOL) then
  begin
-  Assert(false,'TODO:vm_map_type_protect_blockpool');
-  Exit;
+
+  if (WORD(start)=0) and (WORD(__end)=0) and (__end <= entry^.__end) then
+  begin
+   if (start < __end) then
+   begin
+    length:=entry^.start - entry^.offset;
+
+    blockpool_type_protect(map,obj,length,
+                          (start - length) div M_64K,
+                          (__end - length) div M_64K,
+                          new_mtype,new_prot);
+
+    vm_map_unlock(map);
+    Exit(KERN_SUCCESS);
+   end;
+  end else
+  begin
+   vm_map_unlock(map);
+   Exit(KERN_INVALID_ARGUMENT);
+  end;
+
  end;
 
  //mark:MAP_ENTRY_IN_TRANSITION2
@@ -2287,8 +2857,12 @@ begin
  while ((current<>@map^.header) and (current^.start<__end)) do
  begin
 
-  if ((current^.eflags and MAP_ENTRY_IS_SUB_MAP)<>0) or
-     (current^.inheritance=VM_INHERIT_HOLE) then
+  if (current^.inheritance=VM_INHERIT_HOLE) then
+  begin
+   goto _continue_1;
+  end;
+
+  if ((current^.eflags and MAP_ENTRY_IS_SUB_MAP)<>0) then
   begin
    vm_map_unlock(map);
    Exit(KERN_INVALID_ARGUMENT);
@@ -2323,7 +2897,7 @@ begin
 
   rmem_map_lock(rmap);
 
-  if not rmem_map_test(rmap,current^.offset,current^.offset+length,1) then
+  if not rmem_map_test(rmap,current^.offset,current^.offset+length,rt_continuity) then
   begin
    rmem_map_unlock(rmap);
    vm_map_unlock(map);
@@ -2332,7 +2906,8 @@ begin
 
   rmem_map_unlock(rmap);
 
-  current:=current^.next;
+  _continue_1:
+   current:=current^.next;
  end;
 
  /////////
@@ -2342,6 +2917,12 @@ begin
  current:=entry;
  while ((current<>@map^.header) and (current^.start<__end)) do
  begin
+
+  if (current^.inheritance=VM_INHERIT_HOLE) then
+  begin
+   goto _continue_2;
+  end;
+
   vm_map_clip_end(map, current, __end);
 
   old_prot:=current^.protection;
@@ -2366,7 +2947,9 @@ begin
   vm_map_protect_internal(map,current,old_prot);
 
   vm_map_simplify_entry(map, current);
-  current:=current^.next;
+
+  _continue_2:
+   current:=current^.next;
  end;
 
  vm_map_unlock(map);
@@ -2581,12 +3164,12 @@ var
  entry     :vm_map_entry_t;
  temp_entry:vm_map_entry_t;
 begin
+ //Writeln('vm_map_inherit:0x',HexStr(start,12),'..',HexStr(__end,12),':',new_inheritance);
+
  case new_inheritance of
   VM_INHERIT_SHARE,
   VM_INHERIT_COPY ,
-  VM_INHERIT_NONE ,
-  VM_INHERIT_PATCH,
-  VM_INHERIT_HOLE :;
+  VM_INHERIT_NONE :;
  else
   Exit(KERN_INVALID_ARGUMENT);
  end;
@@ -2856,7 +3439,7 @@ begin
    If system unwiring, require that the entry is system wired.
   }
   if ((not user_unwire) and (vm_map_entry_system_wired_count(entry)=0)) or
-     ((entry^.eflags and $800)<>0) then
+     ((entry^.eflags and MAP_ENTRY_WIRE_LOCK)<>0) then
   begin
    __end:=entry^.__end;
    rv:=KERN_INVALID_ARGUMENT;
@@ -3104,8 +3687,8 @@ begin
 
   //Writeln('+MAP_ENTRY_IN_TRANSITION:0x',HexStr(entry^.start,11),'..',HexStr(entry^.__end,11));
 
-  if ((entry^.protection and VM_PROT_ALL)=0)
-      or ((entry^.protection and prot)<>prot) then
+  if ((entry^.protection and VM_PROT_ALL)=0) or
+     ((entry^.protection and prot)<>prot) then
   begin
    entry^.eflags:=entry^.eflags or MAP_ENTRY_WIRE_SKIPPED;
 
@@ -3155,7 +3738,7 @@ begin
    end else
    if ((obj^.flags and OBJ_DMEM_EXT)<>0) then
    begin
-    //dmem
+    //vm_map_wire_dmem
    end else
    if ((obj^.flags and OBJ_WIRE_BUDGET)<>0) then
    begin
@@ -3310,7 +3893,7 @@ _done:
   begin
    if (user_wire) then
    begin
-    entry^.eflags:=entry^.eflags or (ord((flags and 8)<>0)*$800) or MAP_ENTRY_USER_WIRED;
+    entry^.eflags:=entry^.eflags or (ord((flags and VM_MAP_WIRE_LOCK)<>0)*MAP_ENTRY_WIRE_LOCK) or MAP_ENTRY_USER_WIRED;
    end;
   end else
   if (entry^.wired_count=-1) then
@@ -3524,7 +4107,7 @@ begin
  begin
   vm_object_deallocate(entry^.vm_obj);
  end;
- Freemem(entry);
+ uma_zfree(mapentzone, entry);
 end;
 
 {
@@ -3548,46 +4131,61 @@ begin
  //budget
  budget_id:=entry^.budget_id;
  if (budget_id<>-1) and
-    ((entry^.eflags and (MAP_ENTRY_IN_BUDGET or $40000))=MAP_ENTRY_IN_BUDGET) then
+    ((entry^.eflags and (MAP_ENTRY_IN_BUDGET or MAP_ENTRY_KERNEL))=MAP_ENTRY_IN_BUDGET) then
  begin
   entry^.eflags:=entry^.eflags and (not MAP_ENTRY_IN_BUDGET);
   vm_budget_release(budget_id,field_malloc,size);
  end;
  //
 
- if ((entry^.eflags and MAP_ENTRY_IS_SUB_MAP)=0) and
-    (obj<>nil) then
- if (obj^.otype<>OBJT_BLOCKPOOL) then
+ if ((entry^.eflags and MAP_ENTRY_IS_SUB_MAP)=0) then
  begin
-  count:=OFF_TO_IDX(size);
-  offidxstart:=OFF_TO_IDX(entry^.offset);
-  offidx_end:=offidxstart + count;
-  VM_OBJECT_LOCK(obj);
-  if (obj^.ref_count<>1) and
-      (((obj^.flags and (OBJ_NOSPLIT or OBJ_ONEMAPPING))=OBJ_ONEMAPPING)) then
+
+  if (obj<>nil) then
+  if (obj^.otype<>OBJT_BLOCKPOOL) then
   begin
-   vm_object_collapse(obj);
-
-   {
-    * The option OBJPR_NOTMAPPED can be passed here
-    * because vm_map_delete() already performed
-    * pmap_remove() on the only mapping to this range
-    * of pages.
-    }
-   vm_object_page_remove(obj, offidxstart, offidx_end, OBJPR_NOTMAPPED);
-
-   if (offidx_end>=obj^.size) and
-      (offidxstart<obj^.size) then
+   count:=OFF_TO_IDX(size);
+   offidxstart:=OFF_TO_IDX(entry^.offset);
+   offidx_end:=offidxstart + count;
+   VM_OBJECT_LOCK(obj);
+   if (obj^.ref_count<>1) and
+       (((obj^.flags and (OBJ_NOSPLIT or OBJ_ONEMAPPING))=OBJ_ONEMAPPING)) then
    begin
-    obj^.size:=offidxstart;
+    vm_object_collapse(obj);
+
+    {
+     * The option OBJPR_NOTMAPPED can be passed here
+     * because vm_map_delete() already performed
+     * pmap_remove() on the only mapping to this range
+     * of pages.
+     }
+    vm_object_page_remove(obj, offidxstart, offidx_end, OBJPR_NOTMAPPED);
+
+    if (offidx_end>=obj^.size) and
+       (offidxstart<obj^.size) then
+    begin
+     size:=obj^.size;
+     obj^.size:=offidxstart;
+
+     if (obj^.cred) then
+     begin
+      size:=size - offidxstart;
+      obj^.charge:=obj^.charge - ptoa(size);
+     end;
+
+    end;
    end;
+   VM_OBJECT_UNLOCK(obj);
   end;
-  VM_OBJECT_UNLOCK(obj);
+
  end else
  begin
   entry^.vm_obj:=nil;
  end;
 
+ //vm_obj free in vm_map_entry_deallocate
+
+ //free in vm_map_process_deferred
  begin
   entry^.next:=curkthread^.td_map_def_user;
   curkthread^.td_map_def_user:=entry;
@@ -3622,13 +4220,23 @@ end;
 
 //
 
+function vm_can_delete(entry:vm_map_entry_t;cow:DWORD):Boolean; inline;
+begin
+ case entry^.inheritance of
+  VM_INHERIT_PATCH:Result:=((cow and MAP_COW_PATCH)<>0);
+  VM_INHERIT_HOLE :Result:=((cow and MAP_COW_HOLE )<>0);
+  else
+                   Result:=True;
+ end;
+end;
+
 {
  * vm_map_delete: [ internal use only ]
  *
  * Deallocates the given address range from the target
  * map.
  }
-function vm_map_delete(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t;rmap_free:Boolean):Integer;
+function vm_map_delete(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t;cow:DWORD=0):Integer;
 var
  entry      :vm_map_entry_t;
  first_entry:vm_map_entry_t;
@@ -3652,20 +4260,25 @@ begin
  begin
   entry:=first_entry;
 
-  if ((entry^.eflags and MAP_ENTRY_IS_SUB_MAP)<>0) then
+  if (entry^.start < start) then
   begin
-   Exit(KERN_INVALID_ARGUMENT);
+   if ((entry^.eflags and MAP_ENTRY_IS_SUB_MAP)=0) then
+   begin
+    obj:=entry^.vm_obj;
+
+    if (obj<>nil) then
+    if (obj^.otype=OBJT_BLOCKPOOL) then
+    begin
+     Exit(KERN_INVALID_ARGUMENT);
+    end;
+   end;
+
+   if vm_can_delete(entry, cow) then
+   begin
+    vm_map_clip_start(map, entry, start);
+   end;
   end;
 
-  obj:=entry^.vm_obj;
-
-  if (obj<>nil) then
-  if (obj^.otype=OBJT_BLOCKPOOL) then
-  begin
-   Exit(KERN_INVALID_ARGUMENT);
-  end;
-
-  vm_map_clip_start(map, entry, start);
  end;
 
  //check
@@ -3673,21 +4286,21 @@ begin
  while (next<>@map^.header) and (next^.start<__end) do
  begin
 
-  if ((next^.eflags and MAP_ENTRY_IS_SUB_MAP)<>0) then
+  if (next^.__end>__end) then
+  if ((entry^.eflags and MAP_ENTRY_IS_SUB_MAP)=0) then
   begin
-   Exit(KERN_INVALID_ARGUMENT);
+   obj:=next^.vm_obj;
+
+   if (obj<>nil) then
+   if (obj^.otype=OBJT_BLOCKPOOL) then
+   begin
+    Exit(KERN_INVALID_ARGUMENT);
+   end;
   end;
 
-  obj:=next^.vm_obj;
-
-  if (obj<>nil) then
-  if (obj^.otype=OBJT_BLOCKPOOL) then
+  if not vm_can_delete(next, cow) then
   begin
-   Exit(KERN_INVALID_ARGUMENT);
-  end;
-
-  if (next^.inheritance=VM_INHERIT_HOLE) then
-  begin
+   //skip?
    next:=next^.next;
    continue;
   end;
@@ -3701,19 +4314,42 @@ begin
  while (entry<>@map^.header) and (entry^.start<__end) do
  begin
 
-  if (entry^.inheritance=VM_INHERIT_HOLE) then
+  if not vm_can_delete(entry, cow) then
   begin
+   //skip?
    entry:=entry^.next;
    continue;
+  end;
+
+  if ((entry^.eflags and MAP_ENTRY_IS_SUB_MAP)=0) then
+  begin
+   obj:=entry^.vm_obj;
+
+   if (obj<>nil) then
+   if (obj^.otype=OBJT_BLOCKPOOL) then
+   begin
+    //vm_blockpool_name_split
+
+    blockpool_obj_unmap(map,obj,entry^.start,0,IDX_TO_OFF(obj^.size) div M_64K);
+
+    next:=entry^.next;
+
+    vm_map_entry_delete(map, entry);
+
+    entry:=next;
+    continue;
+   end;
   end;
 
   vm_map_clip_end(map, entry, __end);
 
   next:=entry^.next;
 
-  if rmap_free and (obj<>nil) then
+  obj:=entry^.vm_obj;
+
+  if ((cow and MAP_COW_NO_RMAP_FREE)=0) and (obj<>nil) then
   begin
-   if ((obj^.flags and OBJ_DMEM_EXT)<>0) or
+   if ((obj^.flags and (OBJ_DMEM_EXT or OBJ_JITSHM_EXT))<>0) or
       (obj^.otype=OBJT_PHYSHM) then
    begin
     Result:=vm_object_rmap_release(map,
@@ -3724,16 +4360,19 @@ begin
    end;
   end;
 
-  pmap_remove(map^.pmap,
-              entry^.vm_obj,
-              entry^.start,
-              entry^.__end);
-
-  //unmap_jit_cache(entry^.start,entry^.__end);
-
-  if (entry^.wired_count<>0) then
+  if (entry^.inheritance<>VM_INHERIT_HOLE) then
   begin
-   vm_map_entry_unwire(map,entry);
+   pmap_remove(map^.pmap,
+               entry^.vm_obj,
+               entry^.start,
+               entry^.__end);
+
+   //unmap_jit_cache(entry^.start,entry^.__end);
+
+   if (entry^.wired_count<>0) then
+   begin
+    vm_map_entry_unwire(map,entry);
+   end;
   end;
 
   {
@@ -3755,13 +4394,62 @@ end;
  * Remove the given address range from the target map.
  * This is the exported form of vm_map_delete.
  }
-function vm_map_remove(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t):Integer;
+function vm_map_remove(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t;cow:DWORD=0):Integer;
 begin
  vm_map_lock(map);
  VM_MAP_RANGE_CHECK(map, start, __end);
-  Result:=vm_map_delete(map, start, __end, True);
+  Result:=vm_map_delete(map, start, __end, cow);
  vm_map_unlock(map);
 end;
+
+//expand addres space
+function vm_map_expand(map:vm_map_t;start:vm_offset_t;__end:vm_offset_t):Integer;
+var
+ entry      :vm_map_entry_t;
+ first_entry:vm_map_entry_t;
+ next       :vm_map_entry_t;
+begin
+ VM_MAP_ASSERT_LOCKED(map);
+
+ if (start=__end) then
+ begin
+  Exit(KERN_SUCCESS);
+ end;
+
+ if (not vm_map_lookup_entry(map, start, @first_entry)) then
+ begin
+  entry:=first_entry^.next;
+ end else
+ begin
+  entry:=first_entry;
+ end;
+
+ while (entry<>@map^.header) and (entry^.start<__end) do
+ begin
+  next:=entry^.next;
+
+  if (entry^.inheritance=VM_INHERIT_HOLE) then
+  begin
+   vm_map_clip_start(map, entry, start);
+   vm_map_clip_end  (map, entry, __end);
+
+   next:=entry^.next;
+
+   if not pmap_expand(map^.pmap,entry^.start,entry^.__end) then
+   begin
+    vm_map_simplify_entry(map,entry,MAP_COW_HOLE);
+    Exit(KERN_NO_SPACE);
+   end;
+
+   vm_map_entry_delete(map, entry);
+  end;
+
+  entry:=next;
+ end;
+ Result:=(KERN_SUCCESS);
+end;
+
+//
 
 {
  * vm_map_check_protection:
@@ -3824,7 +4512,7 @@ function vm_map_stack(map      :vm_map_t;
                       max_ssize:vm_size_t;
                       prot     :vm_prot_t;
                       max      :vm_prot_t;
-                      cow      :Integer;
+                      cow      :DWORD;
                       anon     :Pointer):Integer;
 var
  new_entry, prev_entry:vm_map_entry_t;
@@ -3844,7 +4532,17 @@ begin
 
  if (addrbos<vm_map_min(map)) or
     (addrbos>vm_map_max(map)) or
-    (addrbos + max_ssize<addrbos) then
+    ((addrbos + max_ssize)<addrbos) then
+ begin
+  Exit(KERN_NO_SPACE);
+ end;
+
+ if ((addrbos shr 47) = 0) and
+    (
+     (addrbos > MAP_AREA_END) or
+     ((addrbos - max_ssize) > MAP_AREA_END)
+    ) and
+    (p_proc.p_sdk_version >= $3000000) then
  begin
   Exit(KERN_NO_SPACE);
  end;
@@ -3918,7 +4616,7 @@ begin
  end;
 
  top:=bot + init_ssize;
- rv:=vm_map_insert(map, nil, 0, bot, top, prot, max, cow, anon, false, true);
+ rv:=vm_map_insert(map, nil, 0, bot, top, VM_PROT_RW, VM_PROT_RW, cow or MAP_COW_AUTO_NAMING, anon);
 
  { Now set the avail_ssize amount. }
  if (rv=KERN_SUCCESS) then
@@ -4142,8 +4840,10 @@ begin
    end;
   end;
 
-  rv:=vm_map_insert(map, nil, 0, addr, stack_entry^.start,
-      next_entry^.protection, next_entry^.max_protection, 0, next_entry^.anon_addr, false, true);
+  rv:=vm_map_insert(map, nil,
+                    0, addr, stack_entry^.start,
+                    next_entry^.protection, next_entry^.max_protection,
+                    MAP_COW_AUTO_NAMING, next_entry^.anon_addr);
 
   { Adjust the available stack space by the amount we grew. }
   if (rv=KERN_SUCCESS) then
@@ -4485,28 +5185,39 @@ begin
  vm_map_unlock(map);
 end;
 
+procedure vm_blockpool_set_name(map:vm_map_t;start,__end:vm_offset_t;name:PChar);
+begin
+ Writeln('TODO:vm_blockpool_set_name');
+end;
+
 procedure vm_map_set_name_locked(map:vm_map_t;start,__end:vm_offset_t;name:PChar);
 var
  current:vm_map_entry_t;
- entry:vm_map_entry_t;
- simpl:vm_map_entry_t;
+ origin :vm_map_entry_t;
+ next   :vm_map_entry_t;
+ simpl  :vm_map_entry_t;
+ e_start:vm_offset_t;
+ e__end :vm_offset_t;
+ sdk_7  :Boolean;
 begin
  if (start=__end) then
  begin
   Exit();
  end;
 
+ sdk_7:=(p_proc.p_sdk_version >= $7000000);
+
  VM_MAP_RANGE_CHECK(map, start, __end);
 
- if (vm_map_lookup_entry(map, start,@entry)) then
+ if (vm_map_lookup_entry(map, start, @origin)) then
  begin
-  vm_map_clip_start(map, entry, start);
+  vm_map_clip_start(map, origin, start);
  end else
  begin
-  entry:=entry^.next;
+  origin :=origin^.next;
  end;
 
- current:=entry;
+ current:=origin;
  while ((current<>@map^.header) and (current^.start<__end)) do
  begin
 
@@ -4514,7 +5225,21 @@ begin
   if (current^.vm_obj<>nil) then
   if (current^.vm_obj^.otype=OBJT_BLOCKPOOL) then
   begin
-   Assert(false,'TODO');
+
+   e_start:=current^.start;
+   if (e_start <= start) then
+   begin
+    e_start:=start;
+   end;
+
+   e__end:=current^.__end;
+   if (__end <= e__end) then
+   begin
+    e__end:=__end;
+   end;
+
+   vm_blockpool_set_name(map,e_start,e__end,name);
+
    current:=current^.next;
    Continue;
   end;
@@ -4524,17 +5249,19 @@ begin
   current^.name:=Default(t_entry_name);
   MoveChar0(name^,current^.name,32);
 
-  if (p_proc.p_sdk_version > $6ffffff) then
+  if sdk_7 then
   begin
    simpl:=current;
   end else
   begin
-   simpl:=entry;
+   simpl:=origin;
   end;
+
+  next:=current^.next;
 
   vm_map_simplify_entry(map, simpl);
 
-  current:=current^.next;
+  current:=next;
  end;
 end;
 
@@ -4710,6 +5437,8 @@ end;
 
 procedure vminit;
 begin
+ mapentzone:=uma_zcreate('MAP ENTRY', sizeof(vm_map_entry), nil, nil, nil, nil, UMA_ALIGN_PTR, 0);
+
  p_proc.p_vmspace:=vmspace_alloc();
 end;
 

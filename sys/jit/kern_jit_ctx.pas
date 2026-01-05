@@ -6,12 +6,13 @@ unit kern_jit_ctx;
 interface
 
 uses
+ vmparam,
  g_node_splay,
  x86_fpdbgdisas,
  x86_jit;
 
 const
- LF_JMP=1;
+ CAN_RESTART=1;
 
 type
  t_point_type=(fpCall,fpData,fpInvalid);
@@ -142,7 +143,6 @@ type
    ptr_next:Pointer;
 
    label_flags:Integer;
-   imm:Word;
    trim:Boolean;
 
    dis:TX86Disassembler;
@@ -203,6 +203,7 @@ function is_xmm(const r:TInstruction):Boolean;
 function is_high(const r:TOperand):Boolean;
 function is_rsp(const r:TRegValue):Boolean;
 function is_rsp(const r:TRegValues):Boolean;
+function is_imm(const r:TInstruction):Boolean;
 function is_invalid(const r:TRegValue):Boolean;
 function is_invalid(const r:TInstruction):Boolean;
 
@@ -948,6 +949,11 @@ end;
 function is_rsp(const r:TRegValues):Boolean; inline;
 begin
  Result:=is_rsp(r[0]) or is_rsp(r[1]);
+end;
+
+function is_imm(const r:TInstruction):Boolean;
+begin
+ Result:=(r.Operand[1].RegValue[0].AType=regNone);
 end;
 
 function is_cl(const r:TRegValue):Boolean; inline;
@@ -2004,7 +2010,7 @@ begin
   xchgq(rcx,rbits);
 
   //addres bits
-  movi(new_reg_size(rcx,os8),43);
+  movi(new_reg_size(rcx,os8),VM_MAX_BITS);
 
   shrx(rcx,dst,rcx);
 
@@ -2021,7 +2027,7 @@ begin
 
   {
   //zero bits
-  movi(new_reg_size(rbits,os8),21); //mov  $21,%bpl
+  movi(new_reg_size(rbits,os8),64-VM_MAX_BITS); //mov  $21,%bpl
 
   //clear hi
   shlx(dst,dst,rbits); //shlx %rbp,%r14,%r14
@@ -2343,10 +2349,12 @@ begin
  with ctx.builder do
   if (not_impl in desc.mem_reg.opt) then
   begin
-   _RR(desc.reg_mem,reg2,reg1,mem_size); //swapped
+   //reg mem
+   _RR(desc.reg_mem,reg1,reg2,True); //swapped
   end else
   begin
-   _RR(desc.mem_reg,reg1,reg2,mem_size);
+   //mem reg
+   _RR(desc.mem_reg,reg1,reg2,False);
   end;
 end;
 
@@ -2897,7 +2905,7 @@ begin
 
       override_mem_in_beg(ctx,ovr,desc.hint,new1);
 
-      mem_size:=ctx.din.Operand[1].RegValue[0].ASize;
+      mem_size:=ctx.din.Operand[2].RegValue[0].ASize;
       Assert(mem_size<>os0);
 
       if ((his_ro in desc.hint) or (mem_size<>os32)) and
@@ -3388,7 +3396,7 @@ begin
       Assert(not is_high(new1));
       Assert(not is_high(new2));
 
-      _RR(desc.mem__cl,new1,new2,mem_size);
+      _RR(desc.mem__cl,new1,new2,False);
 
       op_save(ctx,1,fix_size(new1));
      end;
@@ -3432,7 +3440,7 @@ begin
       Assert(not is_high(new1));
       Assert(not is_high(new2));
 
-      _RR(desc.mem__cl,new1,new2,mem_size);
+      _RR(desc.mem__cl,new1,new2,False);
      end
 
    else
@@ -4341,6 +4349,8 @@ var
 
  i:Byte;
 begin
+ if (Int64(addr)<$4000) then Exit(Default(t_instruction_info));
+
  dis:=Default(TX86Disassembler);
  din:=Default(TInstruction);
 
